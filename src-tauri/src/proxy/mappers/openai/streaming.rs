@@ -53,6 +53,16 @@ pub fn get_thought_signature() -> Option<String> {
     }
 }
 
+/// 清除全局存储的 thoughtSignature（当签名失效时调用）
+pub fn clear_thought_signature() {
+    if let Ok(mut guard) = get_thought_sig_storage().lock() {
+        if guard.is_some() {
+            tracing::info!("[ThoughtSig] 清除失效签名");
+            *guard = None;
+        }
+    }
+}
+
 /// Extract and convert Gemini usageMetadata to OpenAI usage format
 fn extract_usage_metadata(u: &Value) -> Option<super::models::OpenAIUsage> {
     use super::models::{OpenAIUsage, PromptTokensDetails};

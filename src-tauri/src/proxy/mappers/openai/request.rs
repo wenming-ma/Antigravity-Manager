@@ -155,30 +155,33 @@ pub fn transform_openai_request(
             // Handle reasoning_content (thinking)
             if let Some(reasoning) = &msg.reasoning_content {
                 if !reasoning.is_empty() {
-                    // [FIX] For Claude models, thinking blocks REQUIRE valid signatures
-                    // If no global signature available, downgrade to regular text to avoid API rejection
-                    if let Some(ref sig) = global_thought_sig {
-                        // Have a valid signature - use proper thinking block
-                        let thought_part = json!({
-                            "text": reasoning,
-                            "thought": true,
-                            "thoughtSignature": sig
-                        });
-                        parts.push(thought_part);
-                    } else if is_claude_thinking {
-                        // Claude thinking model without signature - downgrade to text
-                        tracing::warn!("[OpenAI-Thinking] No valid signature for Claude thinking block, downgrading to text");
-                        parts.push(json!({"text": format!("<thinking>\n{}\n</thinking>", reasoning)}));
-                    } else if mapped_model_lower.contains("gemini") {
-                        // Gemini models can use skip_thought_signature_validator
-                        let thought_part = json!({
-                            "text": reasoning,
-                            "thought": true,
-                            "thoughtSignature": "skip_thought_signature_validator"
-                        });
-                        parts.push(thought_part);
+                    // [FIX] Only use proper thinking blocks for thinking models
+                    // Non-thinking models should always receive thinking content as regular text
+                    if is_thinking_model {
+                        if let Some(ref sig) = global_thought_sig {
+                            // Have a valid signature - use proper thinking block
+                            let thought_part = json!({
+                                "text": reasoning,
+                                "thought": true,
+                                "thoughtSignature": sig
+                            });
+                            parts.push(thought_part);
+                        } else if mapped_model_lower.contains("gemini") {
+                            // Gemini thinking models can use skip_thought_signature_validator
+                            let thought_part = json!({
+                                "text": reasoning,
+                                "thought": true,
+                                "thoughtSignature": "skip_thought_signature_validator"
+                            });
+                            parts.push(thought_part);
+                        } else {
+                            // Claude thinking model without signature - downgrade to text
+                            tracing::warn!("[OpenAI-Thinking] No valid signature for thinking block, downgrading to text");
+                            parts.push(json!({"text": format!("<thinking>\n{}\n</thinking>", reasoning)}));
+                        }
                     } else {
-                        // Unknown model - downgrade to text to be safe
+                        // Non-thinking model - always downgrade to text
+                        tracing::debug!("[OpenAI-Thinking] Non-thinking model, converting reasoning_content to text");
                         parts.push(json!({"text": format!("<thinking>\n{}\n</thinking>", reasoning)}));
                     }
                 }
@@ -331,13 +334,15 @@ pub fn transform_openai_request(
                     // [New] 递归清理参数中可能存在的非法校验字段
                     crate::proxy::common::json_schema::clean_json_schema(&mut func_call_part);
 
-                    // [修复] 为该消息内的所有工具调用注入 thoughtSignature
-                    if let Some(ref sig) = global_thought_sig {
-                        func_call_part["thoughtSignature"] = json!(sig);
-                    } else if is_thinking_model && !mapped_model.starts_with("projects/") {
-                        // [NEW] Handle missing signature for Gemini thinking models
-                        tracing::debug!("[OpenAI-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", tc.id);
-                        func_call_part["thoughtSignature"] = json!("skip_thought_signature_validator");
+                    // [FIX] 只为思维模型注入 thoughtSignature，避免非思维模型收到无效参数
+                    if is_thinking_model {
+                        if let Some(ref sig) = global_thought_sig {
+                            func_call_part["thoughtSignature"] = json!(sig);
+                        } else if !mapped_model.starts_with("projects/") {
+                            // Gemini thinking models can use skip_thought_signature_validator
+                            tracing::debug!("[OpenAI-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", tc.id);
+                            func_call_part["thoughtSignature"] = json!("skip_thought_signature_validator");
+                        }
                     }
 
                     parts.push(func_call_part);

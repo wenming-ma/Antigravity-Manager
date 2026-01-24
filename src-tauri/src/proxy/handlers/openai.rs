@@ -389,22 +389,25 @@ pub async fn handle_chat_completions(
         }
 
         // [NEW] 处理 400 错误 (Thinking 签名失效)
-        if status_code == 400 
+        if status_code == 400
             && (error_text.contains("Invalid `signature`")
                 || error_text.contains("thinking.signature")
                 || error_text.contains("Invalid signature")
                 || error_text.contains("Corrupted thought signature"))
         {
             tracing::warn!(
-                "[OpenAI] Signature error detected on account {}, retrying without thinking",
+                "[OpenAI] Signature error detected on account {}, clearing invalid signature and retrying",
                 email
             );
-            
+
+            // [FIX] 清除失效的全局签名，避免后续请求继续使用
+            crate::proxy::mappers::openai::streaming::clear_thought_signature();
+
             // 追加修复提示词到最后一条用户消息
             if let Some(last_msg) = openai_req.messages.last_mut() {
                 if last_msg.role == "user" {
                     let repair_prompt = "\n\n[System Recovery] Your previous output contained an invalid signature. Please regenerate the response without the corrupted signature block.";
-                    
+
                     if let Some(content) = &mut last_msg.content {
                         use crate::proxy::mappers::openai::{OpenAIContent, OpenAIContentBlock};
                         match content {
@@ -421,7 +424,7 @@ pub async fn handle_chat_completions(
                     }
                 }
             }
-            
+
             continue; // 重试
         }
 
@@ -1058,6 +1061,22 @@ pub async fn handle_completions(
         // 3. 标记限流状态(用于 UI 显示)
         if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
             token_manager.mark_rate_limited_async(&email, status_code, retry_after.as_deref(), &error_text, Some(&mapped_model)).await;
+        }
+
+        // [FIX] 处理 400 错误 (Thinking 签名失效)
+        if status_code == 400
+            && (error_text.contains("Invalid `signature`")
+                || error_text.contains("thinking.signature")
+                || error_text.contains("Invalid signature")
+                || error_text.contains("Corrupted thought signature"))
+        {
+            tracing::warn!(
+                "[Codex] Signature error detected on account {}, clearing invalid signature and retrying",
+                email
+            );
+            // 清除失效的全局签名
+            crate::proxy::mappers::openai::streaming::clear_thought_signature();
+            continue; // 重试
         }
 
         // 确定重试策略
