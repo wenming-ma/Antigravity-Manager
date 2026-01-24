@@ -536,7 +536,10 @@ pub async fn handle_completions(
                             for part in parts {
                                 // 处理文本块
                                 if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                    text_parts.push(text.to_string());
+                                    // [FIX] Skip empty/whitespace-only text to avoid upstream API rejection
+                                    if !text.trim().is_empty() {
+                                        text_parts.push(text.to_string());
+                                    }
                                 }
                                 // [NEW] 处理图像块 (Codex input_image 格式)
                                 else if part.get("type").and_then(|v| v.as_str())
@@ -568,16 +571,22 @@ pub async fn handle_completions(
 
                         // 构造消息内容：如果有图像则使用数组格式
                         if image_parts.is_empty() {
-                            messages.push(json!({
-                                "role": role,
-                                "content": text_parts.join("\n")
-                            }));
+                            // [FIX] Only add message if there's actual content
+                            let joined_text = text_parts.join("\n");
+                            if !joined_text.trim().is_empty() {
+                                messages.push(json!({
+                                    "role": role,
+                                    "content": joined_text
+                                }));
+                            }
                         } else {
                             let mut content_blocks: Vec<Value> = Vec::new();
-                            if !text_parts.is_empty() {
+                            // [FIX] Only add text block if joined text is non-empty
+                            let joined_text = text_parts.join("\n");
+                            if !joined_text.trim().is_empty() {
                                 content_blocks.push(json!({
                                     "type": "text",
-                                    "text": text_parts.join("\n")
+                                    "text": joined_text
                                 }));
                             }
                             content_blocks.extend(image_parts);

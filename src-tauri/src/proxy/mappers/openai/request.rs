@@ -47,10 +47,10 @@ pub fn transform_openai_request(
     let global_thought_sig = get_thought_signature();
 
     // [NEW] 决定是否开启 Thinking 功能:
-    // 如果是 Claude 思考模型且历史不兼容且没有可用签名来占位, 则禁用 Thinking 以防 400
+    // 如果是思考模型且历史不兼容且没有可用签名来占位, 则禁用 Thinking 以防 400
     let mut actual_include_thinking = is_thinking_model;
-    if is_claude_thinking && has_incompatible_assistant_history && global_thought_sig.is_none() {
-        tracing::warn!("[OpenAI-Thinking] Incompatible assistant history detected for Claude thinking model without global signature. Disabling thinking for this request to avoid 400 error.");
+    if is_thinking_model && has_incompatible_assistant_history && global_thought_sig.is_none() {
+        tracing::warn!("[OpenAI-Thinking] Incompatible assistant history detected for thinking model without global signature. Disabling thinking for this request to avoid 400 error.");
         actual_include_thinking = false;
     }
 
@@ -155,34 +155,62 @@ pub fn transform_openai_request(
             // Handle reasoning_content (thinking)
             if let Some(reasoning) = &msg.reasoning_content {
                 if !reasoning.is_empty() {
-                    let mut thought_part = json!({
-                        "text": reasoning,
-                        "thought": true,
-                    });
+                    // [FIX] For Claude models, thinking blocks REQUIRE valid signatures
+                    // If no global signature available, downgrade to regular text to avoid API rejection
                     if let Some(ref sig) = global_thought_sig {
-                        thought_part["thoughtSignature"] = json!(sig);
+                        // Have a valid signature - use proper thinking block
+                        let thought_part = json!({
+                            "text": reasoning,
+                            "thought": true,
+                            "thoughtSignature": sig
+                        });
+                        parts.push(thought_part);
+                    } else if is_claude_thinking {
+                        // Claude thinking model without signature - downgrade to text
+                        tracing::warn!("[OpenAI-Thinking] No valid signature for Claude thinking block, downgrading to text");
+                        parts.push(json!({"text": format!("<thinking>\n{}\n</thinking>", reasoning)}));
+                    } else if mapped_model_lower.contains("gemini") {
+                        // Gemini models can use skip_thought_signature_validator
+                        let thought_part = json!({
+                            "text": reasoning,
+                            "thought": true,
+                            "thoughtSignature": "skip_thought_signature_validator"
+                        });
+                        parts.push(thought_part);
+                    } else {
+                        // Unknown model - downgrade to text to be safe
+                        parts.push(json!({"text": format!("<thinking>\n{}\n</thinking>", reasoning)}));
                     }
-                    parts.push(thought_part);
                 }
             } else if actual_include_thinking && role == "model" {
                 // [FIX] 解决 Claude 3.7 Thinking 模型的强制性校验:
                 // "Expected thinking... but found tool_use/text"
                 // 如果是思维模型且缺失 reasoning_content, 则注入占位符
-                tracing::debug!("[OpenAI-Thinking] Injecting placeholder thinking block for assistant message");
-                let mut thought_part = json!({
-                    "text": "Applying tool decisions and generating response...",
-                    "thought": true,
-                });
-                
-                // [NEW] 优先使用全局存储的思维签名 (如果可用)
+
+                // [FIX] For Claude thinking models, only inject placeholder if we have a valid signature
+                // Claude API requires valid signatures for thinking blocks
                 if let Some(ref sig) = global_thought_sig {
-                    thought_part["thoughtSignature"] = json!(sig);
-                } else if !mapped_model.starts_with("projects/") && mapped_model.contains("gemini") {
-                    // [FIX] 仅针对 Gemini 思维模型注入跳过标签, Claude 不识别此标签
-                    thought_part["thoughtSignature"] = json!("skip_thought_signature_validator");
+                    tracing::debug!("[OpenAI-Thinking] Injecting placeholder thinking block with signature for assistant message");
+                    let thought_part = json!({
+                        "text": "Applying tool decisions and generating response...",
+                        "thought": true,
+                        "thoughtSignature": sig
+                    });
+                    parts.push(thought_part);
+                } else if mapped_model_lower.contains("gemini") {
+                    // Gemini models can use skip_thought_signature_validator
+                    tracing::debug!("[OpenAI-Thinking] Injecting placeholder thinking block with skip validator for Gemini");
+                    let thought_part = json!({
+                        "text": "Applying tool decisions and generating response...",
+                        "thought": true,
+                        "thoughtSignature": "skip_thought_signature_validator"
+                    });
+                    parts.push(thought_part);
+                } else if is_claude_thinking {
+                    // Claude thinking model without signature - don't inject invalid thinking block
+                    // Just let the request go through without the placeholder to avoid API rejection
+                    tracing::warn!("[OpenAI-Thinking] Cannot inject placeholder thinking block for Claude without valid signature, skipping");
                 }
-                
-                parts.push(thought_part);
             }
 
             // Handle content (multimodal or text)
@@ -192,7 +220,8 @@ pub fn transform_openai_request(
             if let (Some(content), false) = (&msg.content, is_tool_role) {
                 match content {
                     OpenAIContent::String(s) => {
-                        if !s.is_empty() {
+                        // [FIX] Check trim() to catch whitespace-only strings
+                        if !s.trim().is_empty() {
                             parts.push(json!({"text": s}));
                         }
                     }
@@ -200,7 +229,11 @@ pub fn transform_openai_request(
                         for block in blocks {
                             match block {
                                 OpenAIContentBlock::Text { text } => {
-                                    parts.push(json!({"text": text}));
+                                    // [FIX] Skip empty/whitespace-only text blocks to avoid upstream API rejection
+                                    // Error: "messages: text content blocks must contain non-whitespace text"
+                                    if !text.trim().is_empty() {
+                                        parts.push(json!({"text": text}));
+                                    }
                                 }
                                 OpenAIContentBlock::ImageUrl { image_url } => {
                                     if image_url.url.starts_with("data:") {
@@ -516,7 +549,10 @@ pub fn transform_openai_request(
 
     // 2. 追加用户指令 (作为独立 Parts)
     for inst in system_instructions {
-        parts.push(json!({"text": inst}));
+        // [FIX] Skip empty/whitespace-only instructions
+        if !inst.trim().is_empty() {
+            parts.push(json!({"text": inst}));
+        }
     }
 
     inner_request["systemInstruction"] = json!({
