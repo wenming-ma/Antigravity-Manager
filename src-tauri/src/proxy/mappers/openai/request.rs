@@ -25,12 +25,17 @@ pub fn transform_openai_request(
         request.quality.as_deref(), // [NEW] Pass quality parameter
     );
 
-    // 检测 Gemini 3 Pro thinking 模型
-    let is_gemini_3_thinking = mapped_model_lower.contains("gemini-3")
-        && (mapped_model_lower.ends_with("-high")
-            || mapped_model_lower.ends_with("-low")
-            || mapped_model_lower.contains("-pro"));
-    let is_claude_thinking = mapped_model_lower.ends_with("-thinking");
+    // [FIX] 使用 config.final_model 而非 mapped_model_lower 进行思维模型检测
+    // 原因: 当模型被降级时 (如 gemini-3-pro-high -> gemini-2.5-flash 用于联网搜索),
+    // 必须用最终模型来决定是否注入 thinkingConfig
+    let final_model_lower = config.final_model.to_lowercase();
+
+    // 检测 Gemini 3 Pro thinking 模型 (基于最终模型)
+    let is_gemini_3_thinking = final_model_lower.contains("gemini-3")
+        && (final_model_lower.ends_with("-high")
+            || final_model_lower.ends_with("-low")
+            || final_model_lower.contains("-pro"));
+    let is_claude_thinking = final_model_lower.ends_with("-thinking");
     let is_thinking_model = is_gemini_3_thinking || is_claude_thinking;
 
     // [NEW] 检查历史消息是否兼容思维模型 (是否有 Assistant 消息缺失 reasoning_content)
@@ -139,6 +144,7 @@ pub fn transform_openai_request(
     }
 
     // 2. 构建 Gemini contents (过滤掉 system/developer 指令)
+    tracing::debug!("[OpenAI-Request] Building contents from {} messages", request.messages.len());
     let contents: Vec<Value> = request
         .messages
         .iter()
@@ -166,7 +172,7 @@ pub fn transform_openai_request(
                                 "thoughtSignature": sig
                             });
                             parts.push(thought_part);
-                        } else if mapped_model_lower.contains("gemini") {
+                        } else if final_model_lower.contains("gemini") {
                             // Gemini thinking models can use skip_thought_signature_validator
                             let thought_part = json!({
                                 "text": reasoning,
@@ -200,7 +206,7 @@ pub fn transform_openai_request(
                         "thoughtSignature": sig
                     });
                     parts.push(thought_part);
-                } else if mapped_model_lower.contains("gemini") {
+                } else if final_model_lower.contains("gemini") {
                     // Gemini models can use skip_thought_signature_validator
                     tracing::debug!("[OpenAI-Thinking] Injecting placeholder thinking block with skip validator for Gemini");
                     let thought_part = json!({
@@ -306,6 +312,10 @@ pub fn transform_openai_request(
 
             // Handle tool calls (assistant message)
             if let Some(tool_calls) = &msg.tool_calls {
+                tracing::debug!(
+                    "[OpenAI-Request] Processing {} tool calls in assistant message",
+                    tool_calls.len()
+                );
                 for (_index, tc) in tool_calls.iter().enumerate() {
                     /* 暂时移除：防止 Codex CLI 界面碎片化
                     if index == 0 && parts.is_empty() {
@@ -331,14 +341,33 @@ pub fn transform_openai_request(
                         }
                     });
 
+                    tracing::debug!(
+                        "[OpenAI-Request] Reconstructed functionCall: name='{}', args_len={}, id='{}'",
+                        tc.function.name,
+                        args.to_string().len(),
+                        tc.id
+                    );
+
                     // [New] 递归清理参数中可能存在的非法校验字段
                     crate::proxy::common::json_schema::clean_json_schema(&mut func_call_part);
+
+                    // Log the cleaned functionCall
+                    if let Some(fc) = func_call_part.get("functionCall") {
+                        let args_after = fc.get("args").map(|a| a.to_string()).unwrap_or_default();
+                        if args_after.len() != args.to_string().len() {
+                            tracing::warn!(
+                                "[OpenAI-Request] functionCall args were modified by clean_json_schema! Before: {}, After: {}",
+                                args.to_string().len(),
+                                args_after.len()
+                            );
+                        }
+                    }
 
                     // [FIX] 只为思维模型注入 thoughtSignature，避免非思维模型收到无效参数
                     if is_thinking_model {
                         if let Some(ref sig) = global_thought_sig {
                             func_call_part["thoughtSignature"] = json!(sig);
-                        } else if !mapped_model.starts_with("projects/") {
+                        } else if final_model_lower.contains("gemini") {
                             // Gemini thinking models can use skip_thought_signature_validator
                             tracing::debug!("[OpenAI-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", tc.id);
                             func_call_part["thoughtSignature"] = json!("skip_thought_signature_validator");
@@ -450,8 +479,10 @@ pub fn transform_openai_request(
 
     // 4. Handle Tools (Merged Cleaning)
     if let Some(tools) = &request.tools {
+        tracing::debug!("[OpenAI-Tools] Processing {} tools from request", tools.len());
         let mut function_declarations: Vec<Value> = Vec::new();
         for tool in tools.iter() {
+            tracing::debug!("[OpenAI-Tools] Original tool: {}", serde_json::to_string(tool).unwrap_or_default());
             let mut gemini_func = if let Some(func) = tool.get("function") {
                 func.clone()
             } else {
@@ -526,6 +557,12 @@ pub fn transform_openai_request(
                     }),
                 );
             }
+
+            tracing::debug!(
+                "[OpenAI-Tools] Transformed tool '{}': {}",
+                gemini_func.get("name").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                serde_json::to_string(&gemini_func).unwrap_or_default()
+            );
             function_declarations.push(gemini_func);
         }
 

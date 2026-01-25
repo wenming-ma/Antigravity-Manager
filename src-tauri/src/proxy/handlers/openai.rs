@@ -200,6 +200,11 @@ pub async fn handle_chat_completions(
             debug!("[OpenAI-Request] Transformed Gemini Body:\n{}", body_json);
         }
 
+        // [DEBUG] 单独打印工具定义
+        if let Some(tools) = gemini_body.get("request").and_then(|r| r.get("tools")) {
+            tracing::info!("[OpenAI-Tools] Tools sent to Gemini: {}", serde_json::to_string_pretty(tools).unwrap_or_default());
+        }
+
         // 5. 发送请求
         let actual_stream = openai_req.stream;
         
@@ -893,8 +898,13 @@ pub async fn handle_completions(
         let gemini_body = transform_openai_request(&openai_req, &project_id, &mapped_model);
 
         // [New] 打印转换后的报文 (Gemini Body) 供调试 (Codex 路径) ———— 缩减为 simple debug
-        debug!("[Codex-Request] Transformed Gemini Body ({} parts)", 
+        debug!("[Codex-Request] Transformed Gemini Body ({} parts)",
            gemini_body.get("contents").and_then(|c| c.as_array()).map(|a| a.len()).unwrap_or(0));
+
+        // [DEBUG] 单独打印工具定义 (Codex 路径)
+        if let Some(tools) = gemini_body.get("request").and_then(|r| r.get("tools")) {
+            tracing::info!("[Codex-Tools] Tools sent to Gemini: {}", serde_json::to_string_pretty(tools).unwrap_or_default());
+        }
 
         let list_response = openai_req.stream;
         let method = if list_response {

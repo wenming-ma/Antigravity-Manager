@@ -189,12 +189,26 @@ pub fn create_openai_sse_stream(
 
                                                     // Handle function call
                                                     if let Some(func_call) = part.get("functionCall") {
+                                                        tracing::debug!(
+                                                            "[OpenAI-SSE] Received functionCall from Gemini: {}",
+                                                            serde_json::to_string(func_call).unwrap_or_default()
+                                                        );
                                                         let call_key = serde_json::to_string(func_call).unwrap_or_default();
                                                         if !emitted_tool_calls.contains(&call_key) {
                                                             emitted_tool_calls.insert(call_key);
 
                                                             let name = func_call.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                                                            let args = func_call.get("args").unwrap_or(&json!({})).to_string();
+                                                            // [FIX] Handle args properly - if already a string, use directly; otherwise serialize
+                                                            let args = match func_call.get("args") {
+                                                                Some(Value::String(s)) => s.clone(), // Already a JSON string
+                                                                Some(v) if v.is_null() => "{}".to_string(),
+                                                                Some(v) => v.to_string(), // Object/array, serialize
+                                                                None => "{}".to_string(),
+                                                            };
+                                                            tracing::debug!(
+                                                                "[OpenAI-SSE] Transformed tool call: name='{}', args='{}'",
+                                                                name, args
+                                                            );
 
                                                             // Generate stable ID
                                                             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -685,6 +699,10 @@ pub fn create_codex_sse_stream(
 
                                                         // Handle function call in chunk with deduplication
                                                         if let Some(func_call) = part.get("functionCall") {
+                                                            tracing::debug!(
+                                                                "[Codex-SSE] Received functionCall from Gemini: {}",
+                                                                serde_json::to_string(func_call).unwrap_or_default()
+                                                            );
                                                             let call_key = serde_json::to_string(func_call).unwrap_or_default();
                                                             if !emitted_tool_calls.contains(&call_key) {
                                                                 emitted_tool_calls.insert(call_key);
@@ -692,9 +710,21 @@ pub fn create_codex_sse_stream(
                                                                 let name = func_call.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                                                 let name_str = name.to_string();
 
-                                                                let fallback_args = json!({});
-                                                                let args_obj = func_call.get("args").unwrap_or(&fallback_args);
+                                                                // [FIX] Handle args properly - if already a string, parse it; otherwise use directly
+                                                                let args_obj: Value = match func_call.get("args") {
+                                                                    Some(Value::String(s)) => {
+                                                                        // Already a JSON string, parse it back to Value
+                                                                        serde_json::from_str(s).unwrap_or(json!({}))
+                                                                    }
+                                                                    Some(v) if v.is_null() => json!({}),
+                                                                    Some(v) => v.clone(),
+                                                                    None => json!({}),
+                                                                };
                                                                 let args_str = args_obj.to_string();
+                                                                tracing::debug!(
+                                                                    "[Codex-SSE] Transformed tool call: name='{}', args='{}'",
+                                                                    name_str, args_str
+                                                                );
 
                                                                 // Use content-based hash for call_id
                                                                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
