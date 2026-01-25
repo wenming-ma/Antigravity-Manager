@@ -107,6 +107,9 @@ pub fn create_openai_sse_stream(
 
     let stream = async_stream::stream! {
         let mut emitted_tool_calls = std::collections::HashSet::new();
+        let mut tool_call_index_map: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut next_tool_call_index: usize = 0;
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
         let mut error_occurred = false;  // [FIX] 标志位,避免双重 [DONE]
 
@@ -195,7 +198,14 @@ pub fn create_openai_sse_stream(
                                                         );
                                                         let call_key = serde_json::to_string(func_call).unwrap_or_default();
                                                         if !emitted_tool_calls.contains(&call_key) {
-                                                            emitted_tool_calls.insert(call_key);
+                                                            emitted_tool_calls.insert(call_key.clone());
+                                                            let tool_index = tool_call_index_map
+                                                                .entry(call_key.clone())
+                                                                .or_insert_with(|| {
+                                                                    let idx = next_tool_call_index;
+                                                                    next_tool_call_index += 1;
+                                                                    idx
+                                                                });
 
                                                             let name = func_call.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                                             // [FIX] Handle args properly - if already a string, use directly; otherwise serialize
@@ -205,10 +215,6 @@ pub fn create_openai_sse_stream(
                                                                 Some(v) => v.to_string(), // Object/array, serialize
                                                                 None => "{}".to_string(),
                                                             };
-                                                            tracing::debug!(
-                                                                "[OpenAI-SSE] Transformed tool call: name='{}', args='{}'",
-                                                                name, args
-                                                            );
 
                                                             // Generate stable ID
                                                             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -226,8 +232,8 @@ pub fn create_openai_sse_stream(
                                                                     "index": idx as u32,
                                                                     "delta": {
                                                                         "role": "assistant",
-                                                                        "tool_calls": [{
-                                                                            "index": 0,
+                                                                            "tool_calls": [{
+                                                                            "index": *tool_index,
                                                                             "id": call_id,
                                                                             "type": "function",
                                                                             "function": {
