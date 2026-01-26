@@ -479,10 +479,8 @@ pub fn transform_openai_request(
 
     // 4. Handle Tools (Merged Cleaning)
     if let Some(tools) = &request.tools {
-        tracing::debug!("[OpenAI-Tools] Processing {} tools from request", tools.len());
         let mut function_declarations: Vec<Value> = Vec::new();
         for tool in tools.iter() {
-            tracing::debug!("[OpenAI-Tools] Original tool: {}", serde_json::to_string(tool).unwrap_or_default());
             let mut gemini_func = if let Some(func) = tool.get("function") {
                 func.clone()
             } else {
@@ -558,11 +556,6 @@ pub fn transform_openai_request(
                 );
             }
 
-            tracing::debug!(
-                "[OpenAI-Tools] Transformed tool '{}': {}",
-                gemini_func.get("name").and_then(|v| v.as_str()).unwrap_or("unknown"),
-                serde_json::to_string(&gemini_func).unwrap_or_default()
-            );
             function_declarations.push(gemini_func);
         }
 

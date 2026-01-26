@@ -709,34 +709,17 @@ impl TokenManager {
                         let idx = (start_idx + offset) % total;
                         let candidate = &tokens_snapshot[idx];
                         if attempted.contains(&candidate.account_id) {
-                            tracing::debug!(
-                                "Skip {} ({}): already attempted",
-                                candidate.email,
-                                candidate.account_id
-                            );
                             continue;
                         }
 
                         // 【新增 #621】模型级限流检查
                         if quota_protection_enabled && candidate.protected_models.contains(&normalized_target) {
-                            tracing::debug!(
-                                "Skip {} ({}): quota-protected for model {} [{}]",
-                                candidate.email,
-                                candidate.account_id,
-                                normalized_target,
-                                target_model
-                            );
                             tracing::debug!("Account {} is quota-protected for model {} [{}], skipping", candidate.email, normalized_target, target_model);
                             continue;
                         }
 
                         // 【新增】主动避开限流或 5xx 锁定的账号 (高可用优化)
                         if self.is_rate_limited_by_account_id(&candidate.account_id) { // Changed to account_id
-                            tracing::debug!(
-                                "Skip {} ({}): rate-limited",
-                                candidate.email,
-                                candidate.account_id
-                            );
                             continue;
                         }
 
@@ -763,38 +746,18 @@ impl TokenManager {
                     let candidate = &tokens_snapshot[idx];
                     
                     if attempted.contains(&candidate.account_id) {
-                        tracing::debug!(
-                            "  [{}] {} ({}) - SKIP: already attempted",
-                            idx,
-                            candidate.email,
-                            candidate.account_id
-                        );
                         tracing::debug!("  [{}] {} - SKIP: already attempted", idx, candidate.email);
                         continue;
                     }
 
                     // 【新增 #621】模型级限流检查
                     if quota_protection_enabled && candidate.protected_models.contains(&normalized_target) {
-                        tracing::info!(
-                            "  [{}] {} ({}) - SKIP: quota-protected for {} [{}]",
-                            idx,
-                            candidate.email,
-                            candidate.account_id,
-                            normalized_target,
-                            target_model
-                        );
                         tracing::info!("  ⛔ {} - SKIP: quota-protected for {} [{}]", candidate.email, normalized_target, target_model);
                         continue;
                     }
 
                     // 【新增】主动避开限流或 5xx 锁定的账号
                     if self.is_rate_limited_by_account_id(&candidate.account_id) { // Changed to account_id
-                        tracing::info!(
-                            "  [{}] {} ({}) - SKIP: rate-limited",
-                            idx,
-                            candidate.email,
-                            candidate.account_id
-                        );
                         tracing::info!("  ⏳ {} - SKIP: rate-limited", candidate.email);
                         continue;
                     }
