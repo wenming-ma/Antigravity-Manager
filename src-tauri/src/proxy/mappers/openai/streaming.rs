@@ -107,6 +107,7 @@ pub fn create_openai_sse_stream(
 
     let stream = async_stream::stream! {
         let mut emitted_tool_calls = std::collections::HashSet::new();
+        // [FIX] Track unique tool call indices for Cursor compatibility
         let mut tool_call_index_map: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut next_tool_call_index: usize = 0;
@@ -192,13 +193,10 @@ pub fn create_openai_sse_stream(
 
                                                     // Handle function call
                                                     if let Some(func_call) = part.get("functionCall") {
-                                                        tracing::debug!(
-                                                            "[OpenAI-SSE] Received functionCall from Gemini: {}",
-                                                            serde_json::to_string(func_call).unwrap_or_default()
-                                                        );
                                                         let call_key = serde_json::to_string(func_call).unwrap_or_default();
                                                         if !emitted_tool_calls.contains(&call_key) {
                                                             emitted_tool_calls.insert(call_key.clone());
+                                                            // [FIX] Assign unique index per tool call for Cursor compatibility
                                                             let tool_index = tool_call_index_map
                                                                 .entry(call_key.clone())
                                                                 .or_insert_with(|| {
@@ -232,7 +230,7 @@ pub fn create_openai_sse_stream(
                                                                     "index": idx as u32,
                                                                     "delta": {
                                                                         "role": "assistant",
-                                                                            "tool_calls": [{
+                                                                        "tool_calls": [{
                                                                             "index": *tool_index,
                                                                             "id": call_id,
                                                                             "type": "function",
@@ -705,10 +703,6 @@ pub fn create_codex_sse_stream(
 
                                                         // Handle function call in chunk with deduplication
                                                         if let Some(func_call) = part.get("functionCall") {
-                                                            tracing::debug!(
-                                                                "[Codex-SSE] Received functionCall from Gemini: {}",
-                                                                serde_json::to_string(func_call).unwrap_or_default()
-                                                            );
                                                             let call_key = serde_json::to_string(func_call).unwrap_or_default();
                                                             if !emitted_tool_calls.contains(&call_key) {
                                                                 emitted_tool_calls.insert(call_key);
@@ -716,21 +710,9 @@ pub fn create_codex_sse_stream(
                                                                 let name = func_call.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                                                 let name_str = name.to_string();
 
-                                                                // [FIX] Handle args properly - if already a string, parse it; otherwise use directly
-                                                                let args_obj: Value = match func_call.get("args") {
-                                                                    Some(Value::String(s)) => {
-                                                                        // Already a JSON string, parse it back to Value
-                                                                        serde_json::from_str(s).unwrap_or(json!({}))
-                                                                    }
-                                                                    Some(v) if v.is_null() => json!({}),
-                                                                    Some(v) => v.clone(),
-                                                                    None => json!({}),
-                                                                };
+                                                                let fallback_args = json!({});
+                                                                let args_obj = func_call.get("args").unwrap_or(&fallback_args);
                                                                 let args_str = args_obj.to_string();
-                                                                tracing::debug!(
-                                                                    "[Codex-SSE] Transformed tool call: name='{}', args='{}'",
-                                                                    name_str, args_str
-                                                                );
 
                                                                 // Use content-based hash for call_id
                                                                 let mut hasher = std::collections::hash_map::DefaultHasher::new();

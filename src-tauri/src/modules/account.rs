@@ -120,7 +120,7 @@ pub fn save_account(account: &Account) -> Result<(), String> {
 /// List all accounts
 pub fn list_accounts() -> Result<Vec<Account>, String> {
     crate::modules::logger::log_info("Listing accounts...");
-    let mut index = load_account_index()?;
+    let index = load_account_index()?;
     let mut accounts = Vec::new();
     
     for summary in &index.accounts {
@@ -161,6 +161,8 @@ pub fn add_account(email: String, name: Option<String>, token: TokenData) -> Res
         id: account_id.clone(),
         email: email.clone(),
         name: name.clone(),
+        disabled: false,
+        proxy_disabled: false,
         created_at: account.created_at,
         last_used: account.last_used,
     });
@@ -338,9 +340,9 @@ pub fn reorder_accounts(account_ids: &[String]) -> Result<(), String> {
     save_account_index(&index)
 }
 
-/// Switch current account
-pub async fn switch_account(account_id: &str) -> Result<(), String> {
-    use crate::modules::{oauth, process, db, device};
+/// Switch current account (Core Logic)
+pub async fn switch_account(account_id: &str, integration: &(impl modules::integration::SystemIntegration + ?Sized)) -> Result<(), String> {
+    use crate::modules::oauth;
     
     let index = {
         let _lock = ACCOUNT_INDEX_LOCK.lock().map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
@@ -365,57 +367,17 @@ pub async fn switch_account(account_id: &str) -> Result<(), String> {
         save_account(&account)?;
     }
     
-    // 3. Get storage path while process is potentially running (to capture --user-data-dir)
-    let storage_path = device::get_storage_path()?;
-
-    // 4. Close Antigravity (increase timeout to 20s)
-    if process::is_antigravity_running() {
-        process::close_antigravity(20)?;
+    // [FIX] Ensure account has a device profile for isolation
+    if account.device_profile.is_none() {
+        crate::modules::logger::log_info(&format!("Account {} has no bound fingerprint, generating new one for isolation...", account.email));
+        let new_profile = modules::device::generate_profile();
+        apply_profile_to_account(&mut account, new_profile.clone(), Some("auto_generated".to_string()), true)?;
     }
 
-    // 5. Write device profile (generate/bind if missing), only update storage on switch
-    let profile_to_apply = {
-        if let Some(p) = account.device_profile.clone() {
-            p
-        } else {
-            // [FIX] If no bound profile, generate and bind one for isolation
-            // This ensures each account gets a unique fingerprint upon first switch
-            crate::modules::logger::log_info(&format!("Account {} has no bound fingerprint, generating new one for isolation...", account.email));
-            let new_profile = device::generate_profile();
-            // Bind to account and save
-            apply_profile_to_account(&mut account, new_profile.clone(), Some("auto_generated".to_string()), true)?;
-            new_profile
-        }
-    };
-    crate::modules::logger::log_info(&format!(
-        "Writing device profile to storage.json: machineId={}, macMachineId={}, devDeviceId={}, sqmId={}",
-        profile_to_apply.machine_id,
-        profile_to_apply.mac_machine_id,
-        profile_to_apply.dev_device_id,
-        profile_to_apply.sqm_id
-    ));
-    device::write_profile(&storage_path, &profile_to_apply)?;
+    // 3. Execute platform-specific system integration (Close proc, Inject DB, Start proc, etc.)
+    integration.on_account_switch(&account).await?;
 
-    // 5. Get database path and backup
-    let db_path = db::get_db_path()?;
-    if db_path.exists() {
-        let backup_path = db_path.with_extension("vscdb.backup");
-        fs::copy(&db_path, &backup_path)
-            .map_err(|e| format!("failed_to_backup_database: {}", e))?;
-    } else {
-        crate::modules::logger::log_info("Database does not exist, skipping backup");
-    }
-
-    // 6. Inject Token
-    crate::modules::logger::log_info("Injecting Token into database...");
-    db::inject_token(
-        &db_path,
-        &account.token.access_token,
-        &account.token.refresh_token,
-        account.token.expiry_timestamp,
-    )?;
-
-    // 7. Update tool internal state
+    // 4. Update tool internal state
     {
         let _lock = ACCOUNT_INDEX_LOCK.lock().map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
         let mut index = load_account_index()?;
@@ -426,9 +388,7 @@ pub async fn switch_account(account_id: &str) -> Result<(), String> {
     account.update_last_used();
     save_account(&account)?;
 
-    // 8. Restart Antigravity
-    process::start_antigravity()?;
-    crate::modules::logger::log_info(&format!("Account switch completed: {}", account.email));
+    crate::modules::logger::log_info(&format!("Account switch core logic completed: {}", account.email));
 
     Ok(())
 }
@@ -663,6 +623,26 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
     // --- Quota protection logic end ---
 
     save_account(&account)
+}
+
+/// Toggle proxy disabled status for an account
+pub fn toggle_proxy_status(account_id: &str, enable: bool, reason: Option<&str>) -> Result<(), String> {
+    let mut account = load_account(account_id)?;
+    
+    account.proxy_disabled = !enable;
+    account.proxy_disabled_reason = if !enable { reason.map(|s| s.to_string()) } else { None };
+    account.proxy_disabled_at = if !enable { Some(chrono::Utc::now().timestamp()) } else { None };
+    
+    save_account(&account)?;
+    
+    // Also update index summary
+    let mut index = load_account_index()?;
+    if let Some(summary) = index.accounts.iter_mut().find(|a| a.id == account_id) {
+        summary.proxy_disabled = !enable;
+        save_account_index(&index)?;
+    }
+    
+    Ok(())
 }
 
 /// Export all accounts' refresh_tokens

@@ -1,9 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import { X, Download, Sparkles, ArrowRight, Loader2, CheckCircle } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
+import { request as invoke } from '../utils/request';
 import { useTranslation } from 'react-i18next';
-import { check } from '@tauri-apps/plugin-updater';
-import { relaunch } from '@tauri-apps/plugin-process';
+import { check as tauriCheck } from '@tauri-apps/plugin-updater';
+import { relaunch as tauriRelaunch } from '@tauri-apps/plugin-process';
+import { isTauri } from '../utils/env';
+import { showToast } from './common/ToastContainer';
 
 interface UpdateInfo {
   has_update: boolean;
@@ -47,13 +49,18 @@ export const UpdateNotification: React.FC<UpdateNotificationProps> = ({ onClose 
   };
 
   const handleAutoUpdate = async () => {
+    if (!isTauri()) {
+      handleManualDownload();
+      return;
+    }
+
     setUpdateState('downloading');
     try {
-      const update = await check();
+      const update = await tauriCheck();
       if (update) {
         let downloaded = 0;
         let contentLength = 0;
-        
+
         await update.downloadAndInstall((event) => {
           switch (event.event) {
             case 'Started':
@@ -73,11 +80,20 @@ export const UpdateNotification: React.FC<UpdateNotificationProps> = ({ onClose 
 
         setUpdateState('ready');
         setTimeout(async () => {
-          await relaunch();
+          await tauriRelaunch();
         }, 1500);
+      } else {
+        // Native updater found no update (e.g. draft release or updater.json not ready)
+        // Fallback to manual download
+        console.warn('Native updater returned null, falling back to manual download');
+        showToast('自动更新包尚未就绪，为您跳转到下载页面...', 'info');
+        setUpdateState('available');
+        handleManualDownload();
       }
     } catch (error) {
       console.error('Auto update failed:', error);
+      showToast('自动更新失败，为您跳转到下载页面...', 'error');
+      setUpdateState('available'); // Revert state so user can try again
       handleManualDownload();
     }
   };
@@ -132,7 +148,7 @@ export const UpdateNotification: React.FC<UpdateNotificationProps> = ({ onClose 
               </div>
               <div>
                 <h3 className="font-bold text-gray-800 dark:text-white leading-tight">
-                  {updateState === 'ready' 
+                  {updateState === 'ready'
                     ? t('update_notification.ready', '更新完成')
                     : t('update_notification.title')}
                 </h3>
@@ -171,7 +187,7 @@ export const UpdateNotification: React.FC<UpdateNotificationProps> = ({ onClose 
           {updateState === 'downloading' && (
             <div className="mb-4">
               <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-                <div 
+                <div
                   className="bg-gradient-to-r from-blue-500 to-purple-600 h-2 rounded-full transition-all duration-300"
                   style={{ width: `${downloadProgress}%` }}
                 />

@@ -29,6 +29,7 @@ pub fn create_claude_sse_stream(
     scaling_enabled: bool, // [NEW] Flag for context usage scaling
     context_limit: u32,
     estimated_prompt_tokens: Option<u32>, // [FIX] Estimated tokens for calibrator learning
+    message_count: usize, // [NEW v4.0.0] Message count for rewind detection
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> {
     use async_stream::stream;
     use bytes::BytesMut;
@@ -37,6 +38,7 @@ pub fn create_claude_sse_stream(
     Box::pin(stream! {
         let mut state = StreamingState::new();
         state.session_id = session_id; // Set session ID for signature caching
+        state.message_count = message_count; // [NEW v4.0.0] Set message count
         state.scaling_enabled = scaling_enabled; // Set scaling enabled flag
         state.context_limit = context_limit;
         state.estimated_prompt_tokens = estimated_prompt_tokens; // [FIX] Pass estimated tokens
@@ -475,7 +477,8 @@ mod tests {
             None,
             false,
             1_000,
-            None
+            None,
+            1, // message_count
         );
 
         // 3. 收集输出

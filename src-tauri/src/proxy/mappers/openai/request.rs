@@ -25,17 +25,12 @@ pub fn transform_openai_request(
         request.quality.as_deref(), // [NEW] Pass quality parameter
     );
 
-    // [FIX] 使用 config.final_model 而非 mapped_model_lower 进行思维模型检测
-    // 原因: 当模型被降级时 (如 gemini-3-pro-high -> gemini-2.5-flash 用于联网搜索),
-    // 必须用最终模型来决定是否注入 thinkingConfig
-    let final_model_lower = config.final_model.to_lowercase();
-
-    // 检测 Gemini 3 Pro thinking 模型 (基于最终模型)
-    let is_gemini_3_thinking = final_model_lower.contains("gemini-3")
-        && (final_model_lower.ends_with("-high")
-            || final_model_lower.ends_with("-low")
-            || final_model_lower.contains("-pro"));
-    let is_claude_thinking = final_model_lower.ends_with("-thinking");
+    // 检测 Gemini 3 Pro thinking 模型
+    let is_gemini_3_thinking = mapped_model_lower.contains("gemini-3")
+        && (mapped_model_lower.ends_with("-high")
+            || mapped_model_lower.ends_with("-low")
+            || mapped_model_lower.contains("-pro"));
+    let is_claude_thinking = mapped_model_lower.ends_with("-thinking");
     let is_thinking_model = is_gemini_3_thinking || is_claude_thinking;
 
     // [NEW] 检查历史消息是否兼容思维模型 (是否有 Assistant 消息缺失 reasoning_content)
@@ -52,10 +47,10 @@ pub fn transform_openai_request(
     let global_thought_sig = get_thought_signature();
 
     // [NEW] 决定是否开启 Thinking 功能:
-    // 如果是思考模型且历史不兼容且没有可用签名来占位, 则禁用 Thinking 以防 400
+    // 如果是 Claude 思考模型且历史不兼容且没有可用签名来占位, 则禁用 Thinking 以防 400
     let mut actual_include_thinking = is_thinking_model;
-    if is_thinking_model && has_incompatible_assistant_history && global_thought_sig.is_none() {
-        tracing::warn!("[OpenAI-Thinking] Incompatible assistant history detected for thinking model without global signature. Disabling thinking for this request to avoid 400 error.");
+    if is_claude_thinking && has_incompatible_assistant_history && global_thought_sig.is_none() {
+        tracing::warn!("[OpenAI-Thinking] Incompatible assistant history detected for Claude thinking model without global signature. Disabling thinking for this request to avoid 400 error.");
         actual_include_thinking = false;
     }
 
@@ -144,7 +139,6 @@ pub fn transform_openai_request(
     }
 
     // 2. 构建 Gemini contents (过滤掉 system/developer 指令)
-    tracing::debug!("[OpenAI-Request] Building contents from {} messages", request.messages.len());
     let contents: Vec<Value> = request
         .messages
         .iter()
@@ -161,65 +155,34 @@ pub fn transform_openai_request(
             // Handle reasoning_content (thinking)
             if let Some(reasoning) = &msg.reasoning_content {
                 if !reasoning.is_empty() {
-                    // [FIX] Only use proper thinking blocks for thinking models
-                    // Non-thinking models should always receive thinking content as regular text
-                    if is_thinking_model {
-                        if let Some(ref sig) = global_thought_sig {
-                            // Have a valid signature - use proper thinking block
-                            let thought_part = json!({
-                                "text": reasoning,
-                                "thought": true,
-                                "thoughtSignature": sig
-                            });
-                            parts.push(thought_part);
-                        } else if final_model_lower.contains("gemini") {
-                            // Gemini thinking models can use skip_thought_signature_validator
-                            let thought_part = json!({
-                                "text": reasoning,
-                                "thought": true,
-                                "thoughtSignature": "skip_thought_signature_validator"
-                            });
-                            parts.push(thought_part);
-                        } else {
-                            // Claude thinking model without signature - downgrade to text
-                            tracing::warn!("[OpenAI-Thinking] No valid signature for thinking block, downgrading to text");
-                            parts.push(json!({"text": format!("<thinking>\n{}\n</thinking>", reasoning)}));
-                        }
-                    } else {
-                        // Non-thinking model - always downgrade to text
-                        tracing::debug!("[OpenAI-Thinking] Non-thinking model, converting reasoning_content to text");
-                        parts.push(json!({"text": format!("<thinking>\n{}\n</thinking>", reasoning)}));
+                    let mut thought_part = json!({
+                        "text": reasoning,
+                        "thought": true,
+                    });
+                    if let Some(ref sig) = global_thought_sig {
+                        thought_part["thoughtSignature"] = json!(sig);
                     }
+                    parts.push(thought_part);
                 }
             } else if actual_include_thinking && role == "model" {
                 // [FIX] 解决 Claude 3.7 Thinking 模型的强制性校验:
                 // "Expected thinking... but found tool_use/text"
                 // 如果是思维模型且缺失 reasoning_content, 则注入占位符
-
-                // [FIX] For Claude thinking models, only inject placeholder if we have a valid signature
-                // Claude API requires valid signatures for thinking blocks
+                tracing::debug!("[OpenAI-Thinking] Injecting placeholder thinking block for assistant message");
+                let mut thought_part = json!({
+                    "text": "Applying tool decisions and generating response...",
+                    "thought": true,
+                });
+                
+                // [NEW] 优先使用全局存储的思维签名 (如果可用)
                 if let Some(ref sig) = global_thought_sig {
-                    tracing::debug!("[OpenAI-Thinking] Injecting placeholder thinking block with signature for assistant message");
-                    let thought_part = json!({
-                        "text": "Applying tool decisions and generating response...",
-                        "thought": true,
-                        "thoughtSignature": sig
-                    });
-                    parts.push(thought_part);
-                } else if final_model_lower.contains("gemini") {
-                    // Gemini models can use skip_thought_signature_validator
-                    tracing::debug!("[OpenAI-Thinking] Injecting placeholder thinking block with skip validator for Gemini");
-                    let thought_part = json!({
-                        "text": "Applying tool decisions and generating response...",
-                        "thought": true,
-                        "thoughtSignature": "skip_thought_signature_validator"
-                    });
-                    parts.push(thought_part);
-                } else if is_claude_thinking {
-                    // Claude thinking model without signature - don't inject invalid thinking block
-                    // Just let the request go through without the placeholder to avoid API rejection
-                    tracing::warn!("[OpenAI-Thinking] Cannot inject placeholder thinking block for Claude without valid signature, skipping");
+                    thought_part["thoughtSignature"] = json!(sig);
+                } else if !mapped_model.starts_with("projects/") && mapped_model.contains("gemini") {
+                    // [FIX] 仅针对 Gemini 思维模型注入跳过标签, Claude 不识别此标签
+                    thought_part["thoughtSignature"] = json!("skip_thought_signature_validator");
                 }
+                
+                parts.push(thought_part);
             }
 
             // Handle content (multimodal or text)
@@ -238,8 +201,7 @@ pub fn transform_openai_request(
                         for block in blocks {
                             match block {
                                 OpenAIContentBlock::Text { text } => {
-                                    // [FIX] Skip empty/whitespace-only text blocks to avoid upstream API rejection
-                                    // Error: "messages: text content blocks must contain non-whitespace text"
+                                    // [FIX] Skip empty/whitespace-only text blocks
                                     if !text.trim().is_empty() {
                                         parts.push(json!({"text": text}));
                                     }
@@ -312,10 +274,6 @@ pub fn transform_openai_request(
 
             // Handle tool calls (assistant message)
             if let Some(tool_calls) = &msg.tool_calls {
-                tracing::debug!(
-                    "[OpenAI-Request] Processing {} tool calls in assistant message",
-                    tool_calls.len()
-                );
                 for (_index, tc) in tool_calls.iter().enumerate() {
                     /* 暂时移除：防止 Codex CLI 界面碎片化
                     if index == 0 && parts.is_empty() {
@@ -341,37 +299,16 @@ pub fn transform_openai_request(
                         }
                     });
 
-                    tracing::debug!(
-                        "[OpenAI-Request] Reconstructed functionCall: name='{}', args_len={}, id='{}'",
-                        tc.function.name,
-                        args.to_string().len(),
-                        tc.id
-                    );
-
                     // [New] 递归清理参数中可能存在的非法校验字段
                     crate::proxy::common::json_schema::clean_json_schema(&mut func_call_part);
 
-                    // Log the cleaned functionCall
-                    if let Some(fc) = func_call_part.get("functionCall") {
-                        let args_after = fc.get("args").map(|a| a.to_string()).unwrap_or_default();
-                        if args_after.len() != args.to_string().len() {
-                            tracing::warn!(
-                                "[OpenAI-Request] functionCall args were modified by clean_json_schema! Before: {}, After: {}",
-                                args.to_string().len(),
-                                args_after.len()
-                            );
-                        }
-                    }
-
-                    // [FIX] 只为思维模型注入 thoughtSignature，避免非思维模型收到无效参数
-                    if is_thinking_model {
-                        if let Some(ref sig) = global_thought_sig {
-                            func_call_part["thoughtSignature"] = json!(sig);
-                        } else if final_model_lower.contains("gemini") {
-                            // Gemini thinking models can use skip_thought_signature_validator
-                            tracing::debug!("[OpenAI-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", tc.id);
-                            func_call_part["thoughtSignature"] = json!("skip_thought_signature_validator");
-                        }
+                    // [修复] 为该消息内的所有工具调用注入 thoughtSignature
+                    if let Some(ref sig) = global_thought_sig {
+                        func_call_part["thoughtSignature"] = json!(sig);
+                    } else if is_thinking_model && !mapped_model.starts_with("projects/") {
+                        // [NEW] Handle missing signature for Gemini thinking models
+                        tracing::debug!("[OpenAI-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", tc.id);
+                        func_call_part["thoughtSignature"] = json!("skip_thought_signature_validator");
                     }
 
                     parts.push(func_call_part);
@@ -555,7 +492,6 @@ pub fn transform_openai_request(
                     }),
                 );
             }
-
             function_declarations.push(gemini_func);
         }
 
@@ -584,10 +520,7 @@ pub fn transform_openai_request(
 
     // 2. 追加用户指令 (作为独立 Parts)
     for inst in system_instructions {
-        // [FIX] Skip empty/whitespace-only instructions
-        if !inst.trim().is_empty() {
-            parts.push(json!({"text": inst}));
-        }
+        parts.push(json!({"text": inst}));
     }
 
     inner_request["systemInstruction"] = json!({

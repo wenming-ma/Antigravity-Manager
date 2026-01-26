@@ -1,4 +1,4 @@
-use crate::models::{Account, AppConfig, QuotaData, TokenData};
+use crate::models::{Account, AppConfig, QuotaData};
 use crate::modules;
 use tauri_plugin_opener::OpenerExt;
 use tauri::{Emitter, Manager};
@@ -23,38 +23,19 @@ pub async fn add_account(
     _email: String,
     refresh_token: String,
 ) -> Result<Account, String> {
-    // 1. 使用 refresh_token 获取 access_token
-    // 注意：这里我们忽略传入的 _email，而是直接去 Google 获取真实的邮箱
-    let token_res = modules::oauth::refresh_access_token(&refresh_token).await?;
-
-    // 2. 获取用户信息
-    let user_info = modules::oauth::get_user_info(&token_res.access_token).await?;
-
-    // 3. 构造 TokenData
-    let token = TokenData::new(
-        token_res.access_token,
-        refresh_token, // 继续使用用户传入的 refresh_token
-        token_res.expires_in,
-        Some(user_info.email.clone()),
-        None, // project_id 将在需要时获取
-        None, // session_id
+    let service = modules::account_service::AccountService::new(
+        crate::modules::integration::SystemManager::Desktop(app.clone())
     );
 
-    // 4. 使用真实的 email 添加或更新账号
-    let account =
-        modules::upsert_account(user_info.email.clone(), user_info.get_display_name(), token)?;
+    let mut account = service.add_account(&refresh_token).await?;
 
-    modules::logger::log_info(&format!("添加账号成功: {}", account.email));
-
-    // 5. 自动触发刷新额度
-    let mut account = account;
+    // 自动刷新配额
     let _ = internal_refresh_account_quota(&app, &mut account).await;
 
-    // 6. If proxy is running, reload token pool so changes take effect immediately.
+    // 重载账号池
     let _ = crate::commands::proxy::reload_proxy_accounts(
         app.state::<crate::commands::proxy::ProxyServiceState>(),
-    )
-    .await;
+    ).await;
 
     Ok(account)
 }
@@ -62,16 +43,10 @@ pub async fn add_account(
 /// 删除账号
 #[tauri::command]
 pub async fn delete_account(app: tauri::AppHandle, account_id: String) -> Result<(), String> {
-    modules::logger::log_info(&format!("收到删除账号请求: {}", account_id));
-    modules::delete_account(&account_id).map_err(|e| {
-        modules::logger::log_error(&format!("删除账号失败: {}", e));
-        e
-    })?;
-    modules::logger::log_info(&format!("账号删除成功: {}", account_id));
-
-    // 强制同步托盘
-    crate::modules::tray::update_tray_menus(&app);
-    Ok(())
+    let service = modules::account_service::AccountService::new(
+        crate::modules::integration::SystemManager::Desktop(app.clone())
+    );
+    service.delete_account(&account_id)
 }
 
 /// 批量删除账号
@@ -112,15 +87,19 @@ pub async fn switch_account(
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
     account_id: String,
 ) -> Result<(), String> {
-    let res = modules::switch_account(&account_id).await;
-    if res.is_ok() {
-        crate::modules::tray::update_tray_menus(&app);
+    let service = modules::account_service::AccountService::new(
+        crate::modules::integration::SystemManager::Desktop(app.clone())
+    );
+    
+    service.switch_account(&account_id).await?;
+    
+    // 同步托盘
+    crate::modules::tray::update_tray_menus(&app);
 
-        // [FIX #820] Notify proxy to clear stale session bindings and reload accounts
-        // This prevents API requests from routing to the wrong account after switching
-        let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
-    }
-    res
+    // [FIX #820] Notify proxy to clear stale session bindings and reload accounts
+    let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
+    
+    Ok(())
 }
 
 /// 获取当前账号
@@ -195,10 +174,10 @@ pub async fn fetch_account_quota(
 
 pub use modules::account::RefreshStats;
 
-/// 刷新所有账号配额
-#[tauri::command]
-pub async fn refresh_all_quotas(
-    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+/// 刷新所有账号配额 (内部实现)
+pub async fn refresh_all_quotas_internal(
+    proxy_state: &crate::commands::proxy::ProxyServiceState,
+    app_handle: Option<tauri::AppHandle>,
 ) -> Result<RefreshStats, String> {
     let stats = modules::account::refresh_all_quotas_logic().await?;
 
@@ -208,7 +187,22 @@ pub async fn refresh_all_quotas(
         let _ = instance.token_manager.reload_all_accounts().await;
     }
 
+    // 发送全局刷新事件给 UI (如果需要)
+    if let Some(handle) = app_handle {
+        use tauri::Emitter;
+        let _ = handle.emit("accounts://refreshed", ());
+    }
+
     Ok(stats)
+}
+
+/// 刷新所有账号配额 (Tauri Command)
+#[tauri::command]
+pub async fn refresh_all_quotas(
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+    app_handle: tauri::AppHandle,
+) -> Result<RefreshStats, String> {
+    refresh_all_quotas_internal(&proxy_state, Some(app_handle)).await
 }
 /// 获取设备指纹（当前 storage.json + 账号绑定）
 #[tauri::command]
@@ -338,60 +332,16 @@ pub async fn save_config(
 #[tauri::command]
 pub async fn start_oauth_login(app_handle: tauri::AppHandle) -> Result<Account, String> {
     modules::logger::log_info("开始 OAuth 授权流程...");
-
-    // 1. 启动 OAuth 流程获取 Token
-    let token_res = modules::oauth_server::start_oauth_flow(app_handle.clone()).await?;
-
-    // 2. 检查 refresh_token
-    let refresh_token = token_res.refresh_token.ok_or_else(|| {
-        "未获取到 Refresh Token。\n\n\
-         可能原因:\n\
-         1. 您之前已授权过此应用,Google 不会再次返回 refresh_token\n\n\
-         解决方案:\n\
-         1. 访问 https://myaccount.google.com/permissions\n\
-         2. 撤销 'Antigravity Tools' 的访问权限\n\
-         3. 重新进行 OAuth 授权\n\n\
-         或者使用 'Refresh Token' 标签页手动添加账号"
-            .to_string()
-    })?;
-
-    // 3. 获取用户信息
-    let user_info = modules::oauth::get_user_info(&token_res.access_token).await?;
-    modules::logger::log_info(&format!("获取用户信息成功: {}", user_info.email));
-
-    // 4. 尝试获取项目ID
-    let project_id = crate::proxy::project_resolver::fetch_project_id(&token_res.access_token)
-        .await
-        .ok();
-
-    if let Some(ref pid) = project_id {
-        modules::logger::log_info(&format!("获取项目ID成功: {}", pid));
-    } else {
-        modules::logger::log_warn("未能获取项目ID,将在后续懒加载");
-    }
-
-    // 5. 构造 TokenData
-    let token_data = TokenData::new(
-        token_res.access_token,
-        refresh_token,
-        token_res.expires_in,
-        Some(user_info.email.clone()),
-        project_id,
-        None,
+    let service = modules::account_service::AccountService::new(
+        crate::modules::integration::SystemManager::Desktop(app_handle.clone())
     );
 
-    // 6. 添加或更新到账号列表
-    modules::logger::log_info("正在保存账号信息...");
-    let mut account = modules::upsert_account(
-        user_info.email.clone(),
-        user_info.get_display_name(),
-        token_data,
-    )?;
+    let mut account = service.start_oauth_login().await?;
 
-    // 7. 自动触发刷新额度
+    // 自动触发刷新额度
     let _ = internal_refresh_account_quota(&app_handle, &mut account).await;
 
-    // 8. If proxy is running, reload token pool so changes take effect immediately.
+    // Reload token pool
     let _ = crate::commands::proxy::reload_proxy_accounts(
         app_handle.state::<crate::commands::proxy::ProxyServiceState>(),
     )
@@ -404,60 +354,16 @@ pub async fn start_oauth_login(app_handle: tauri::AppHandle) -> Result<Account, 
 #[tauri::command]
 pub async fn complete_oauth_login(app_handle: tauri::AppHandle) -> Result<Account, String> {
     modules::logger::log_info("完成 OAuth 授权流程 (manual)...");
-
-    // 1. 等待回调并交换 Token（不 open browser）
-    let token_res = modules::oauth_server::complete_oauth_flow(app_handle.clone()).await?;
-
-    // 2. 检查 refresh_token
-    let refresh_token = token_res.refresh_token.ok_or_else(|| {
-        "未获取到 Refresh Token。\n\n\
-         可能原因:\n\
-         1. 您之前已授权过此应用,Google 不会再次返回 refresh_token\n\n\
-         解决方案:\n\
-         1. 访问 https://myaccount.google.com/permissions\n\
-         2. 撤销 'Antigravity Tools' 的访问权限\n\
-         3. 重新进行 OAuth 授权\n\n\
-         或者使用 'Refresh Token' 标签页手动添加账号"
-            .to_string()
-    })?;
-
-    // 3. 获取用户信息
-    let user_info = modules::oauth::get_user_info(&token_res.access_token).await?;
-    modules::logger::log_info(&format!("获取用户信息成功: {}", user_info.email));
-
-    // 4. 尝试获取项目ID
-    let project_id = crate::proxy::project_resolver::fetch_project_id(&token_res.access_token)
-        .await
-        .ok();
-
-    if let Some(ref pid) = project_id {
-        modules::logger::log_info(&format!("获取项目ID成功: {}", pid));
-    } else {
-        modules::logger::log_warn("未能获取项目ID,将在后续懒加载");
-    }
-
-    // 5. 构造 TokenData
-    let token_data = TokenData::new(
-        token_res.access_token,
-        refresh_token,
-        token_res.expires_in,
-        Some(user_info.email.clone()),
-        project_id,
-        None,
+    let service = modules::account_service::AccountService::new(
+        crate::modules::integration::SystemManager::Desktop(app_handle.clone())
     );
 
-    // 6. 添加或更新到账号列表
-    modules::logger::log_info("正在保存账号信息...");
-    let mut account = modules::upsert_account(
-        user_info.email.clone(),
-        user_info.get_display_name(),
-        token_data,
-    )?;
+    let mut account = service.complete_oauth_login().await?;
 
-    // 7. 自动触发刷新额度
+    // 自动触发刷新额度
     let _ = internal_refresh_account_quota(&app_handle, &mut account).await;
 
-    // 8. If proxy is running, reload token pool so changes take effect immediately.
+    // Reload token pool
     let _ = crate::commands::proxy::reload_proxy_accounts(
         app_handle.state::<crate::commands::proxy::ProxyServiceState>(),
     )
@@ -469,7 +375,10 @@ pub async fn complete_oauth_login(app_handle: tauri::AppHandle) -> Result<Accoun
 /// 预生成 OAuth 授权链接 (不打开浏览器)
 #[tauri::command]
 pub async fn prepare_oauth_url(app_handle: tauri::AppHandle) -> Result<String, String> {
-    crate::modules::oauth_server::prepare_oauth_url(app_handle).await
+    let service = modules::account_service::AccountService::new(
+        crate::modules::integration::SystemManager::Desktop(app_handle.clone())
+    );
+    service.prepare_oauth_url().await
 }
 
 #[tauri::command]

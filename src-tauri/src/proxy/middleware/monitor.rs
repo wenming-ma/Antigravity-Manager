@@ -23,7 +23,7 @@ pub async fn monitor_middleware(
     let method = request.method().to_string();
     let uri = request.uri().to_string();
     
-    if uri.contains("event_logging") {
+    if uri.contains("event_logging") || uri.contains("/api/") {
         return next.run(request).await;
     }
     

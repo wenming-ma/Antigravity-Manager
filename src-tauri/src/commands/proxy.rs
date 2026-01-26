@@ -1,6 +1,7 @@
 use tauri::State;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Serialize, Deserialize};
 use crate::proxy::{ProxyConfig, TokenManager};
 use tokio::time::Duration;
@@ -17,9 +18,17 @@ pub struct ProxyStatus {
 }
 
 /// 反代服务全局状态
+#[derive(Clone)]
 pub struct ProxyServiceState {
     pub instance: Arc<RwLock<Option<ProxyServiceInstance>>>,
     pub monitor: Arc<RwLock<Option<Arc<ProxyMonitor>>>>,
+    pub admin_server: Arc<RwLock<Option<AdminServerInstance>>>, // [NEW] 常驻管理服务器
+    pub starting: Arc<AtomicBool>, // [NEW] 标识是否正在启动中，防止死锁
+}
+
+pub struct AdminServerInstance {
+    pub axum_server: crate::proxy::AxumServer,
+    pub server_handle: tokio::task::JoinHandle<()>,
 }
 
 /// 反代服务实例
@@ -35,29 +44,68 @@ impl ProxyServiceState {
         Self {
             instance: Arc::new(RwLock::new(None)),
             monitor: Arc::new(RwLock::new(None)),
+            admin_server: Arc::new(RwLock::new(None)),
+            starting: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
-/// 启动反代服务
+/// 启动反代服务 (Tauri 命令)
 #[tauri::command]
 pub async fn start_proxy_service(
     config: ProxyConfig,
     state: State<'_, ProxyServiceState>,
+    cf_state: State<'_, crate::commands::cloudflared::CloudflaredState>,
     app_handle: tauri::AppHandle,
 ) -> Result<ProxyStatus, String> {
-    let mut instance_lock = state.instance.write().await;
-    
-    // 防止重复启动
-    if instance_lock.is_some() {
-        return Err("服务已在运行中".to_string());
+    internal_start_proxy_service(
+        config,
+        &state,
+        crate::modules::integration::SystemManager::Desktop(app_handle),
+        Arc::new(cf_state.inner().clone()),
+    ).await
+}
+
+struct StartingGuard(Arc<AtomicBool>);
+impl Drop for StartingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
+}
+
+/// 内部启动反代服务逻辑 (解耦版本)
+pub async fn internal_start_proxy_service(
+    config: ProxyConfig,
+    state: &ProxyServiceState,
+    integration: crate::modules::integration::SystemManager,
+    cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
+) -> Result<ProxyStatus, String> {
+    // 1. 检查状态并加锁
+    {
+        let instance_lock = state.instance.read().await;
+        if instance_lock.is_some() {
+            return Err("服务已在运行中".to_string());
+        }
+    }
+
+    // 2. 检查是否正在启动中 (防止死锁 & 并发启动)
+    if state.starting.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err("服务正在启动中，请稍候...".to_string());
+    }
+
+    // 使用自定义 Drop guard 确保无论成功失败都会重置 starting 状态
+    let _starting_guard = StartingGuard(state.starting.clone());
 
     // Ensure monitor exists
     {
         let mut monitor_lock = state.monitor.write().await;
         if monitor_lock.is_none() {
-            *monitor_lock = Some(Arc::new(ProxyMonitor::new(1000, Some(app_handle.clone()))));
+            let app_handle = if let crate::modules::integration::SystemManager::Desktop(ref h) = integration {
+                Some(h.clone())
+            } else {
+                None
+            };
+            *monitor_lock = Some(Arc::new(ProxyMonitor::new(1000, app_handle)));
         }
         // Sync enabled state from config
         if let Some(monitor) = monitor_lock.as_ref() {
@@ -65,72 +113,122 @@ pub async fn start_proxy_service(
         }
     }
     
-    let monitor = state.monitor.read().await.as_ref().unwrap().clone();
+    let _monitor = state.monitor.read().await.as_ref().unwrap().clone();
     
     // 2. 初始化 Token 管理器
     let app_data_dir = crate::modules::account::get_data_dir()?;
-    // Ensure accounts dir exists even if the user will only use non-Google providers (e.g. z.ai).
     let _ = crate::modules::account::get_accounts_dir()?;
     let accounts_dir = app_data_dir.clone();
     
     let token_manager = Arc::new(TokenManager::new(accounts_dir));
-    token_manager.start_auto_cleanup(); // 启动限流记录自动清理后台任务
-    // 同步 UI 传递的调度配置
+    token_manager.start_auto_cleanup();
     token_manager.update_sticky_config(config.scheduling.clone()).await;
     
-    // 3. 加载账号
+    // 檢查並啟動管理服務器（如果尚未運行）
+    ensure_admin_server(config.clone(), state, integration.clone(), cloudflared_state.clone()).await?;
+
+    // 3. 加載賬號
     let active_accounts = token_manager.load_accounts().await
-        .map_err(|e| format!("加载账号失败: {}", e))?;
+        .unwrap_or(0);
     
     if active_accounts == 0 {
         let zai_enabled = config.zai.enabled
             && !matches!(config.zai.dispatch_mode, crate::proxy::ZaiDispatchMode::Off);
         if !zai_enabled {
-            return Err("没有可用账号，请先添加账号".to_string());
+            tracing::warn!("沒有可用賬號，反代邏輯將暫停，請通過管理界面添加。");
+            return Ok(ProxyStatus {
+                running: false,
+                port: config.port,
+                base_url: format!("http://127.0.0.1:{}", config.port),
+                active_accounts: 0,
+            });
         }
     }
-    
-    // 启动 Axum 服务器
-    let (axum_server, server_handle) =
-        match crate::proxy::AxumServer::start(
-            config.get_bind_address().to_string(),
-            config.port,
-            token_manager.clone(),
-            config.custom_mapping.clone(),
-            config.request_timeout,
-            config.upstream_proxy.clone(),
-            crate::proxy::ProxySecurityConfig::from_proxy_config(&config),
-            config.zai.clone(),
-            monitor.clone(),
-            config.experimental.clone(),
 
-        ).await {
-            Ok((server, handle)) => (server, handle),
-            Err(e) => return Err(format!("启动 Axum 服务器失败: {}", e)),
-        };
+    let mut instance_lock = state.instance.write().await;
+    let admin_lock = state.admin_server.read().await;
+    let axum_server = admin_lock.as_ref().unwrap().axum_server.clone();
     
-    // 创建服务实例
+    // 创建服务实例（逻辑启动）
     let instance = ProxyServiceInstance {
         config: config.clone(),
-        token_manager: token_manager.clone(), // Clone for ProxyServiceInstance
-        axum_server,
-        server_handle,
+        token_manager: token_manager.clone(),
+        axum_server: axum_server.clone(),
+        server_handle: tokio::spawn(async {}), // 逻辑上的 handle
     };
+    
+    // [FIX] Ensure the server is logically running
+    axum_server.set_running(true).await;
     
     *instance_lock = Some(instance);
     
-
-    // 保存配置到全局 AppConfig
-    let mut app_config = crate::modules::config::load_app_config().map_err(|e| e)?;
-    app_config.proxy = config.clone();
-    crate::modules::config::save_app_config(&app_config).map_err(|e| e)?;
-    
+    // 成功启动后，guard 在这里结束并重置 starting 是 OK 的
+    // 但其实我们可以直接手动掉，或者相信 guard
     Ok(ProxyStatus {
         running: true,
         port: config.port,
         base_url: format!("http://127.0.0.1:{}", config.port),
         active_accounts,
     })
+}
+
+/// 确保管理服务器正在运行
+pub async fn ensure_admin_server(
+    config: ProxyConfig,
+    state: &ProxyServiceState,
+    integration: crate::modules::integration::SystemManager,
+    cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
+) -> Result<(), String> {
+    let mut admin_lock = state.admin_server.write().await;
+    if admin_lock.is_some() {
+        return Ok(());
+    }
+
+    // Ensure monitor exists
+    let monitor = {
+        let mut monitor_lock = state.monitor.write().await;
+        if monitor_lock.is_none() {
+            let app_handle = if let crate::modules::integration::SystemManager::Desktop(ref h) = integration {
+                Some(h.clone())
+            } else {
+                None
+            };
+            *monitor_lock = Some(Arc::new(ProxyMonitor::new(1000, app_handle)));
+        }
+        monitor_lock.as_ref().unwrap().clone()
+    };
+
+    // 默认空 TokenManager 用于管理界面
+    let app_data_dir = crate::modules::account::get_data_dir()?;
+    let token_manager = Arc::new(TokenManager::new(app_data_dir));
+    // [NEW] 加载账号数据，否则管理界面统计为 0
+    let _ = token_manager.load_accounts().await;
+
+    let (axum_server, server_handle) =
+        match crate::proxy::AxumServer::start(
+            config.get_bind_address().to_string(),
+            config.port,
+            token_manager,
+            config.custom_mapping.clone(),
+            config.request_timeout,
+            config.upstream_proxy.clone(),
+            crate::proxy::ProxySecurityConfig::from_proxy_config(&config),
+            config.zai.clone(),
+            monitor,
+            config.experimental.clone(),
+            integration.clone(),
+            cloudflared_state,
+        ).await {
+            Ok((server, handle)) => (server, handle),
+            Err(e) => return Err(format!("启动管理服务器失败: {}", e)),
+        };
+
+    *admin_lock = Some(AdminServerInstance {
+        axum_server,
+        server_handle,
+    });
+
+    Ok(())
 }
 
 /// 停止反代服务
@@ -144,11 +242,10 @@ pub async fn stop_proxy_service(
         return Err("服务未运行".to_string());
     }
     
-    // 停止 Axum 服务器
+    // 停止 Axum 服务器 (仅逻辑停止，不杀死进程)
     if let Some(instance) = instance_lock.take() {
-        instance.axum_server.stop();
-        // 等待服务器任务完成
-        instance.server_handle.await.ok();
+        instance.axum_server.set_running(false).await;
+        // 已移除 instance.axum_server.stop() 调用，防止杀死 Admin Server
     }
     
     Ok(())
@@ -159,21 +256,45 @@ pub async fn stop_proxy_service(
 pub async fn get_proxy_status(
     state: State<'_, ProxyServiceState>,
 ) -> Result<ProxyStatus, String> {
-    let instance_lock = state.instance.read().await;
-    
-    match instance_lock.as_ref() {
-        Some(instance) => Ok(ProxyStatus {
-            running: true,
-            port: instance.config.port,
-            base_url: format!("http://127.0.0.1:{}", instance.config.port),
-            active_accounts: instance.token_manager.len(),
-        }),
-        None => Ok(ProxyStatus {
-            running: false,
+    // 优先检查启动标志，避免被写锁阻塞
+    if state.starting.load(Ordering::SeqCst) {
+        return Ok(ProxyStatus {
+            running: false, // 逻辑上还没运行
             port: 0,
-            base_url: String::new(),
+            base_url: "starting".to_string(), // 给前端标识
             active_accounts: 0,
-        }),
+        });
+    }
+
+    // 使用 try_read 避免在该命令中产生产生排队延迟
+    let lock_res = state.instance.try_read();
+    
+    match lock_res {
+        Ok(instance_lock) => {
+            match instance_lock.as_ref() {
+                Some(instance) => Ok(ProxyStatus {
+                    running: true,
+                    port: instance.config.port,
+                    base_url: format!("http://127.0.0.1:{}", instance.config.port),
+                    active_accounts: instance.token_manager.len(),
+                }),
+                None => Ok(ProxyStatus {
+                    running: false,
+                    port: 0,
+                    base_url: String::new(),
+                    active_accounts: 0,
+                }),
+            }
+        },
+        Err(_) => {
+            // 如果拿不到锁，说明正在进行写操作（可能是正在启动或停止中）
+            Ok(ProxyStatus {
+                running: false,
+                port: 0,
+                base_url: "busy".to_string(),
+                active_accounts: 0,
+            })
+        }
     }
 }
 

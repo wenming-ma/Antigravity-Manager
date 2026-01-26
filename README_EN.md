@@ -1,6 +1,6 @@
 # Antigravity Tools 🚀
 # Antigravity Tools 🚀
-> Professional AI Account Management & Proxy System (v3.3.50)
+> Professional AI Account Management & Proxy System (v4.0.2)
 
 <div align="center">
   <img src="public/icon.png" alt="Antigravity Logo" width="120" height="120" style="border-radius: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.15);">
@@ -10,7 +10,7 @@
   
   <p>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-3.3.50-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.0.2-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -114,6 +114,8 @@ graph TD
 ## 📥 Installation
 
 ### Option A: Terminal Installation (macOS & Linux Recommended)
+
+#### macOS
 If you have [Homebrew](https://brew.sh/) installed, run:
 
 ```bash
@@ -123,9 +125,24 @@ brew tap lbjlaq/antigravity-manager https://github.com/lbjlaq/Antigravity-Manage
 # 2. Install the app
 brew install --cask antigravity-tools
 ```
-> **Tip**: 
-> - **macOS**: If you encounter permission issues, add the `--no-quarantine` flag.
-> - **Linux**: The AppImage will be automatically symlinked to your binary path with executable permissions.
+> **Tip**: If you encounter permission issues, add the `--no-quarantine` flag.
+
+#### Arch Linux
+You can choose to install via the one-click script or Homebrew:
+
+**Option 1: One-click script (Recommended)**
+```bash
+curl -sSL https://raw.githubusercontent.com/lbjlaq/Antigravity-Manager/main/deploy/arch/install.sh | bash
+```
+
+**Option 2: via Homebrew** (If you have [Linuxbrew](https://sh.brew.sh/) installed)
+```bash
+brew tap lbjlaq/antigravity-manager https://github.com/lbjlaq/Antigravity-Manager
+brew install --cask antigravity-tools
+```
+
+#### Other Linux Distributions
+The AppImage will be automatically symlinked to your binary path with executable permissions.
 
 ### Option B: Manual Download
 Download from [GitHub Releases](https://github.com/lbjlaq/Antigravity-Manager/releases):
@@ -133,38 +150,55 @@ Download from [GitHub Releases](https://github.com/lbjlaq/Antigravity-Manager/re
 *   **Windows**: `.msi` or portable `.zip`
 *   **Linux**: `.deb` or `AppImage`
 
-### Option C: Arch Linux (Official Script)
-We provide an official one-liner installation script for Arch Linux users. It automatically fetches the latest release from GitHub and installs it:
-```bash
-curl -sSL https://raw.githubusercontent.com/lbjlaq/Antigravity-Manager/main/deploy/arch/install.sh | bash
-```
-> **Tip**: This script will automatically download the latest `.deb` assets and install them using `makepkg`.
-
-### Option C: Remote Server Deployment (Headless Linux)
-If you need to run on a headless remote Linux server (Ubuntu/Debian/CentOS), use our **Headless (Xvfb)** one-click deployment solution:
+### Option C: Docker Deployment (Recommended for NAS/Servers)
+If you prefer running in a containerized environment, we provide a native Docker image. This image supports the v4.0.2 Native Headless architecture, automatically hosts frontend static resources, and allows for direct browser-based management.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lbjlaq/Antigravity-Manager/main/deploy/headless-xvfb/install.sh | sudo bash
-```
-> **Note**: This solution uses Xvfb to simulate a GUI environment. Resource consumption (RAM/CPU) will be higher than a native backend service.
-> **See**: [Server Deployment Guide (deploy/headless-xvfb)](./deploy/headless-xvfb/README.md)
+# Option 1: Direct Run (Recommended)
+# - API_KEY: Required. Used for AI request authentication.
+# - WEB_PASSWORD: Optional. Used for Web UI login. Defaults to API_KEY if NOT set.
+docker run -d --name antigravity-manager \
+  -p 8045:8045 \
+  -e API_KEY=sk-your-api-key \
+  -e WEB_PASSWORD=your-login-password \
+  -v ~/.antigravity_tools:/root/.antigravity_tools \
+  lbjlaq/antigravity-manager:latest
 
-### Option D: Docker Deployment (Recommended for NAS/Servers)
-If you prefer running in a containerized environment, we provide a full Docker image and configuration with built-in noVNC support for direct browser-based GUI access.
+# Forgot keys? Run `docker logs antigravity-manager` or `grep -E '"api_key"|"admin_password"' ~/.antigravity_tools/gui_config.json`
 
-```bash
-# 1. Enter the deployment directory
-cd deploy/docker
+#### 🔐 Authentication Scenarios
+*   **Scenario A: Only `API_KEY` is set**
+    - **Web Login**: Use `API_KEY` to access the dashboard.
+    - **API Calls**: Use `API_KEY` for AI request authentication.
+*   **Scenario B: Both `API_KEY` and `WEB_PASSWORD` are set (Recommended)**
+    - **Web Login**: **Must** use `WEB_PASSWORD`. Using API Key will be rejected (more secure).
+    - **API Calls**: Continue to use `API_KEY`. This allows you to share the API Key with team members while keeping the password for administrative access only.
 
+#### 🆙 Upgrade Guide for Older Versions
+If you are upgrading from v4.0.1 or earlier, your installation won't have a `WEB_PASSWORD` set by default. You can add one using any of these methods:
+1.  **Web UI (Recommended)**: Log in using your existing `API_KEY`, go to the **API Proxy Settings** page, find the **Web UI Management Password** section below the API Key, set your new password, and save.
+2.  **Environment Variable (Docker)**: Stop the old container and start the new one with the added parameter `-e WEB_PASSWORD=your_new_password`. **Note: Environment variables have the highest priority and will override any changes in the UI.**
+3.  **Config File (Persistent)**: Directly edit `~/.antigravity_tools/gui_config.json` and add/modify `"admin_password": "your_new_password"` inside the `proxy` object.
+    - *Note: `WEB_PASSWORD` is the environment variable name, while `admin_password` is the JSON key in the config file.*
+
+> [!TIP]
+> **Priority Logic**:
+> - **Environment Variable** (`WEB_PASSWORD`) has the highest priority. If set, the application will always use it and ignore values in the configuration file.
+> - **Configuration File** (`gui_config.json`) is used for persistent storage. When you change the password via Web UI and save, it is written here.
+> - **Fallback**: If neither is set, it falls back to `API_KEY`; if even `API_KEY` is missing, a random one is generated.
+
+# Option 2: Use Docker Compose
+# 1. Enter the Docker directory
+cd docker
 # 2. Start the service
 docker compose up -d
 ```
-> **Access URL**: `http://localhost:6080/vnc_lite.html` (Default VNC password: `password`)
+> **Access URL**: `http://localhost:8045` (Admin Console) | `http://localhost:8045/v1` (API Base)
 > **System Requirements**:
-> - **RAM**: **2GB** recommended (minimum 512MB).
-> - **Shared Memory**: Requires `shm_size: 2gb` (pre-configured in compose) to prevent browser crashes.
+> - **RAM**: **1GB** recommended (minimum 256MB).
+> - **Persistence**: Mount `/root/.antigravity_tools` to persist your data.
 > - **Architecture**: Supports x86_64 and ARM64.
-> **See**: [Docker Deployment Guide (deploy/docker)](./deploy/docker/README.md)
+> **See**: [Docker Deployment Guide (docker)](./docker/README.md)
 
 ### 🛠️ Troubleshooting
 
@@ -212,7 +246,91 @@ print(response.choices[0].message.content)
 ## 📝 Developer & Community
 
 *   **Changelog**:
-    *   **v3.3.50 (2026-01-23)**:
+    *   **v4.0.2 (2026-01-26)**:
+        -   **[Core Fix] Session Persistence After Account Switch (Fix Issue #1159)**:
+            - Enhanced database injection logic to synchronize identity info (Email) and clear legacy UserID cache during account switching.
+            - Resolved session association failures caused by mismatches between the new Token and old identity metadata.
+        -   **[Core Fix] Model Mapping Persistence in Docker/Web Mode (Fix Issue #1149)**:
+            - Resolved an issue where model mapping configurations modified via API in Docker or Web deployment modes were not saved to disk.
+            - Ensured the `admin_update_model_mapping` interface correctly invokes persistence logic, so configurations remain effective after container restarts.
+        -   **[Architecture Optimization] MCP Tool Support Architecture Upgrade (Schema Cleaning & Tool Adapters)**:
+            - **Constraint Semantic Backfilling (Constraint Hints)**:
+                - Implemented intelligent constraint migration mechanism that converts unsupported constraint fields (`minLength`, `pattern`, `format`, etc.) into description hints before removal.
+                - Added `CONSTRAINT_FIELDS` constant and `move_constraints_to_description` function to ensure models can understand original constraints through descriptions.
+                - Example: `{"minLength": 5}` → `{"description": "[Constraint: minLen: 5]"}`
+            - **Enhanced anyOf/oneOf Intelligent Flattening**:
+                - Rewrote `extract_best_schema_from_union` function with scoring mechanism to select the best type (object > array > scalar).
+                - Automatically adds `"Accepts: type1 | type2"` hints to descriptions after merging, preserving all possible type information.
+                - Added `get_schema_type_name` function supporting explicit types and structural inference.
+            - **Pluggable Tool Adapter Layer (Tool Adapter System)**:
+                - Created `ToolAdapter` trait providing customized Schema processing capabilities for different MCP tools.
+                - Implemented `PencilAdapter` that automatically adds descriptions for Pencil drawing tool's visual properties (`cornerRadius`, `strokeWidth`) and path parameters.
+                - Established global adapter registry supporting tool-specific optimizations via `clean_json_schema_for_tool` function.
+            - **High-Performance Cache Layer (Schema Cache)**:
+                - Implemented SHA-256 hash-based Schema caching mechanism to avoid redundant cleaning of identical schemas.
+                - Uses LRU eviction strategy with max 1000 entries, memory usage < 10MB.
+                - Provides `clean_json_schema_cached` function and cache statistics, expected 60%+ performance improvement.
+            - **Impact**: 
+                - ✅ Significantly improves Schema compatibility and model understanding for MCP tools (e.g., Pencil)
+                - ✅ Establishes pluggable foundation for adding more MCP tools (filesystem, database, etc.) in the future
+                - ✅ Fully backward compatible, all 25 tests passing
+        -   **[Security Enhancement] Web UI Management Password & API Key Separation (Fix Issue #1139)**:
+            - **Independent Password Configuration**: Support setting a separate management console login password via `ABV_WEB_PASSWORD` or `WEB_PASSWORD` environment variables.
+            - **Intelligent Authentication Logic**: 
+                - Management interfaces prioritize validating the independent password, automatically falling back to `API_KEY` if not set (ensuring backward compatibility).
+                - AI Proxy interfaces strictly only allow `API_KEY` for authentication, achieving permission isolation.
+            - **Configuration UI Support**: Added a management password editing item in "Dashboard - Service Config," supporting one-click retrieval or modification.
+            - **Log Guidance**: Headless mode startup clearly prints the status and retrieval methods for both API Key and Web UI Password.
+    *   **v4.0.1 (2026-01-26)**:
+        -   **[UX Optimization] Theme & Language Transition Smoothness**:
+            - Resolved the UI freezing issue during theme and language switching by decoupling configuration persistence from the state update loop.
+            - Optimized View Transition API usage in the Navbar to ensure non-blocking visual updates.
+            - Made window background sync calls asynchronous to prevent React render delays.
+        -   **[Core Fix] Proxy Service Startup Deadlock**:
+            - Fixed a race condition/deadlock where starting the proxy service would block status polling requests.
+            - Introduced an atomic startup flag and non-blocking status checks to ensure the UI remains responsive during service initialization.
+    *   **v4.0.0 (2026-01-25)**:
+        -   **[Major Architecture] Deep Migration to Tauri v2**:
+            - Fully adapted to Tauri v2 core APIs, including system tray, window management, and event systems.
+            - Resolved asynchronous Trait dynamic dispatch and lifecycle conflict issues, significantly enhancing backend performance and stability.
+        -   **[Deployment Revolution] Native Headless Docker Mode**:
+            - Implemented a "pure backend" Docker image, completely removing dependencies on VNC, noVNC, or XVFB, significantly reducing RAM and CPU usage.
+            - Supports direct hosting of frontend static resources; the management console is accessible via browser immediately after container startup.
+        -   **[Deployment Fix] Arch Linux Installation Script Fix (PR #1108)**:
+            - Fixed the extraction failure in `deploy/arch/PKGBUILD.template` caused by hardcoded `data.tar.zst`.
+            - Implemented dynamic compression format detection using wildcards, ensuring compatibility across different `.deb` package versions.
+        -   **[Management Upgrade] Full-Featured Web Console**:
+            - Refactored the management dashboard, enabling all core features (Account management, API proxy monitoring, OAuth authorization, model mapping) to be completed via browser.
+            - Completed OAuth callback handling for Web mode, supporting `ABV_PUBLIC_URL` customization, perfectly adapting to remote VPS or NAS deployment scenarios.
+        -   **[Normalization] Structural Cleanup & Unitization**:
+            - Cleaned up redundant `deploy` directories and legacy scripts, resulting in a more modern project structure.
+            - Standardized the Docker image name as `antigravity-manager` and integrated a dedicated `docker/` directory and manual.
+        -   **[API Enhancement] Traffic Logs & Monitoring**:
+            - Optimized the real-time monitoring experience for traffic logs, adding polling mechanisms and statistics endpoints for Web mode.
+            - Refined management API route placeholder naming for improved calling precision.
+        -   **[UX Improvement] Monitor Page Layout & Dark Mode Optimization (PR #1105)**:
+            -   **Layout Refactoring**: Optimized the container layout of the traffic log page with a fixed max-width and responsive margins. This resolves content stretching issues on large screens, offering a more comfortable visual experience.
+            -   **Dark Mode Consistency**: Migrated the color scheme of the log detail modal from hardcoded Slate colors to the Base theme. This ensures seamless integration with the global dark mode style and improves visual consistency.
+        -   **[UX Improvement] Auto-Update Fallback Mechanism**:
+            -   **Smart Fallback**: Fixed the issue where the update button would be unresponsive if the native package was not ready (e.g., Draft Release). The system now detects this state, notifies the user, and gracefully falls back to browser-based download.
+        -   **[Core Fix] Deep Optimization of Signature Cache & Rewind Detection (PR #1094)**:
+            -   **400 Error Self-healing**: Enhanced the cleaning logic for thinking block signatures. The system now automatically identifies "orphaned signatures" caused by server restarts and proactively strips them before sending to upstream, fundamentally preventing `400 Invalid signature` errors.
+            -   **Rewind Detection Mechanism**: Upgraded the cache layer to include Message Count validation. When a user rewinds the conversation history and resends, the system automatically resets the signature state to ensure dialogue flow validity.
+            -   **Full-chain Adaptation**: Optimized data links for Claude, Gemini, and z.ai (Anthropic) to ensure precise propagation of message counts in both streaming and non-streaming requests.
+        -   **[OpenAI Robustness] Enhanced Retry Policy & Model-level Isolation (PR #1093)**:
+            -   **Robust Retries**: Enforced a minimum of 2 attempts for OpenAI handlers to handle transient jitters; removed hard-stop on quota exhaustion to allow account rotation.
+            -   **Model-level Isolation**: Implemented fine-grained rate limiting for OpenAI requests, preventing model-specific limits from locking the whole account.
+            -   **API Fix**: Resolved an email/ID inconsistency in TokenManager's async interface, ensuring accurate rate-limit tracking.
+        -   **[System Robustness] Unified Retry & Backoff Hub**:
+            -   **Logic Normalization**: Abstracted retry logic from individual protocol handlers into `common.rs`, achieving system-wide logic normalization.
+            -   **Enforced Backoff Delays**: Completely fixed the issue where requests would retry immediately when a `Retry-After` header was missing. All handlers now execute physical wait times via the shared module before retrying, protecting IP reputation.
+            -   **Aggressive Parameter Tuning**: Significantly increased initial backoff times for 429 and 503 errors to **5s-10s**, drastically reducing production risk and prevent account bans.
+        -   **[CLI Sync Optimization] Resolved Token Conflict & Model Config Cleanup (PR #1054)**:
+            -   **Automatic Conflict Resolution**: Automatically removes the conflicting `ANTHROPIC_AUTH_TOKEN` when setting `ANTHROPIC_API_KEY`, resolving sync errors for the Claude CLI.
+            -   **Environment Variable Cleanup**: Proactively removes environment variables like `ANTHROPIC_MODEL` that might interfere with model defaults, ensuring consistent CLI behavior.
+            -   **Configuration Robustness**: Improved handling of empty API keys to prevent invalid configurations from affecting the sync process.
+
+    *   **v4.0.0 (2026-01-25)**:
         -   **[Core Feature] Configurable Background Task Models**:
             -   **Enhancement**: Users can now customize the model used for "Background Tasks" (e.g., title generation, summary compression), decoupled from the hardcoded `gemini-2.5-flash`.
             -   **UI Update**: Added a "Background Task Model" setting in the "Model Mapping" page, allowing selection of any available model (e.g., `gemini-3-flash`) via dropdown.

@@ -132,8 +132,9 @@ pub struct ExperimentalConfig {
     pub enable_cross_model_checks: bool,
 
     /// 启用上下文用量缩放 (Context Usage Scaling)
-    /// 用于解决客户端因 Gemini 上下文过大而错误触发压缩的问题
-    #[serde(default = "default_true")]
+    /// 激进模式: 缩放用量并激活自动压缩以突破 200k 限制
+    /// 默认关闭以保持透明度,让客户端能触发原生压缩指令
+    #[serde(default = "default_false")]
     pub enable_usage_scaling: bool,
 
     /// 上下文压缩阈值 L1 (Tool Trimming)
@@ -155,7 +156,7 @@ impl Default for ExperimentalConfig {
             enable_signature_cache: true,
             enable_tool_loop_recovery: true,
             enable_cross_model_checks: true,
-            enable_usage_scaling: true,
+            enable_usage_scaling: false,  // 默认关闭,回归透明模式
             context_compression_threshold_l1: 0.4,
             context_compression_threshold_l2: 0.55,
             context_compression_threshold_l3: 0.7,
@@ -169,6 +170,10 @@ fn default_threshold_l3() -> f32 { 0.7 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 /// 反代服务配置
@@ -196,6 +201,9 @@ pub struct ProxyConfig {
 
     /// API 密钥
     pub api_key: String,
+    
+    /// Web UI 管理后台密码 (可选，如未设置则使用 api_key)
+    pub admin_password: Option<String>,
 
     /// 是否自动启动
     pub auto_start: bool,
@@ -246,6 +254,7 @@ impl Default for ProxyConfig {
             auth_mode: ProxyAuthMode::default(),
             port: 8045,
             api_key: format!("sk-{}", uuid::Uuid::new_v4().simple()),
+            admin_password: None,
             auto_start: false,
             custom_mapping: std::collections::HashMap::new(),
             request_timeout: default_request_timeout(),

@@ -229,6 +229,7 @@ pub struct StreamingState {
     // [FIX #859] Post-thinking interruption tracking
     pub has_thinking: bool,
     pub has_content: bool,
+    pub message_count: usize, // [NEW v4.0.0] Message count for rewind detection
 }
 
 impl StreamingState {
@@ -255,6 +256,7 @@ impl StreamingState {
             estimated_prompt_tokens: None,
             has_thinking: false,
             has_content: false,
+            message_count: 0,
         }
     }
 
@@ -772,7 +774,11 @@ impl<'a> PartProcessor<'a> {
 
             // 2. [NEW v3.3.17] Cache to session-based storage for tool loop recovery
             if let Some(session_id) = &self.state.session_id {
-                SignatureCache::global().cache_session_signature(session_id, sig.clone());
+                SignatureCache::global().cache_session_signature(
+                    session_id, 
+                    sig.clone(), 
+                    self.state.message_count
+                );
                 tracing::debug!(
                     "[Claude-SSE] Cached signature to session {} (length: {})",
                     session_id,
@@ -971,7 +977,11 @@ impl<'a> PartProcessor<'a> {
 
             // 3. [NEW v3.3.17] Cache to session-based storage
             if let Some(session_id) = &self.state.session_id {
-                SignatureCache::global().cache_session_signature(session_id, sig.clone());
+                SignatureCache::global().cache_session_signature(
+                    session_id, 
+                    sig.clone(),
+                    self.state.message_count
+                );
             }
 
             tracing::debug!(

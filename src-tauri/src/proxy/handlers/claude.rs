@@ -9,7 +9,7 @@ use axum::{
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::{json, Value};
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 use tracing::{debug, error, info};
 
 use crate::proxy::mappers::claude::{
@@ -100,139 +100,9 @@ The structure MUST be as follows:
 // [REMOVED] apply_jitter function
 // Jitter logic removed to restore stability (v3.3.16 fix)
 
-/// 重试策略枚举
-#[derive(Debug, Clone)]
-enum RetryStrategy {
-    /// 不重试，直接返回错误
-    NoRetry,
-    /// 固定延迟
-    FixedDelay(Duration),
-    /// 线性退避：base_ms * (attempt + 1)
-    LinearBackoff { base_ms: u64 },
-    /// 指数退避：base_ms * 2^attempt，上限 max_ms
-    ExponentialBackoff { base_ms: u64, max_ms: u64 },
-}
-
-/// 根据错误状态码和错误信息确定重试策略
-fn determine_retry_strategy(
-    status_code: u16,
-    error_text: &str,
-    retried_without_thinking: bool,
-) -> RetryStrategy {
-    match status_code {
-        // 400 错误：Thinking 签名失败
-        400 if !retried_without_thinking
-            && (error_text.contains("Invalid `signature`")
-                || error_text.contains("thinking.signature")
-                || error_text.contains("thinking.thinking")) =>
-        {
-            // 固定 200ms 延迟后重试
-            RetryStrategy::FixedDelay(Duration::from_millis(200))
-        }
-
-        // 429 限流错误
-        429 => {
-            // 优先使用服务端返回的 Retry-After
-            if let Some(delay_ms) = crate::proxy::upstream::retry::parse_retry_delay(error_text) {
-                let actual_delay = delay_ms.saturating_add(200).min(10_000);
-                RetryStrategy::FixedDelay(Duration::from_millis(actual_delay))
-            } else {
-                // 否则使用线性退避：1s, 2s, 3s
-                RetryStrategy::LinearBackoff { base_ms: 1000 }
-            }
-        }
-
-        // 503 服务不可用 / 529 服务器过载
-        503 | 529 => {
-            // 指数退避：1s, 2s, 4s, 8s
-            RetryStrategy::ExponentialBackoff {
-                base_ms: 1000,
-                max_ms: 8000,
-            }
-        }
-
-        // 500 服务器内部错误
-        500 => {
-            // 线性退避：500ms, 1s, 1.5s
-            RetryStrategy::LinearBackoff { base_ms: 500 }
-        }
-
-        // 401/403 认证/权限错误：可重试（轮换账号）
-        401 | 403 => RetryStrategy::FixedDelay(Duration::from_millis(100)),
-
-        // 其他错误：不重试
-        _ => RetryStrategy::NoRetry,
-    }
-}
-
-/// 执行退避策略并返回是否应该继续重试
-async fn apply_retry_strategy(
-    strategy: RetryStrategy,
-    attempt: usize,
-    status_code: u16,
-    trace_id: &str,
-) -> bool {
-    match strategy {
-        RetryStrategy::NoRetry => {
-            debug!("[{}] Non-retryable error {}, stopping", trace_id, status_code);
-            false
-        }
-
-        RetryStrategy::FixedDelay(duration) => {
-            let base_ms = duration.as_millis() as u64;
-            info!(
-                "[{}] ⏱️  Retry with fixed delay: status={}, attempt={}/{}, base={}ms",
-                trace_id,
-                status_code,
-                attempt + 1,
-                MAX_RETRY_ATTEMPTS,
-                base_ms
-            );
-            sleep(duration).await;
-            true
-        }
-
-        RetryStrategy::LinearBackoff { base_ms } => {
-            let calculated_ms = base_ms * (attempt as u64 + 1);
-            info!(
-                "[{}] ⏱️  Retry with linear backoff: status={}, attempt={}/{}, base={}ms",
-                trace_id,
-                status_code,
-                attempt + 1,
-                MAX_RETRY_ATTEMPTS,
-                calculated_ms
-            );
-            sleep(Duration::from_millis(calculated_ms)).await;
-            true
-        }
-
-        RetryStrategy::ExponentialBackoff { base_ms, max_ms } => {
-            let calculated_ms = (base_ms * 2_u64.pow(attempt as u32)).min(max_ms);
-            info!(
-                "[{}] ⏱️  Retry with exponential backoff: status={}, attempt={}/{}, base={}ms",
-                trace_id,
-                status_code,
-                attempt + 1,
-                MAX_RETRY_ATTEMPTS,
-                calculated_ms
-            );
-            sleep(Duration::from_millis(calculated_ms)).await;
-            true
-        }
-    }
-}
-
-/// 判断是否应该轮换账号
-fn should_rotate_account(status_code: u16) -> bool {
-    match status_code {
-        // 这些错误是账号级别的，需要轮换
-        429 | 401 | 403 | 500 => true,
-        // 这些错误是服务端级别的，轮换账号无意义
-        400 | 503 | 529 => false,
-        // 其他错误默认不轮换
-        _ => false,
-    }
-}
+// ===== 统一退避策略模块 =====
+// 移除本地重复定义，使用 common 中的统一实现
+use super::common::{determine_retry_strategy, apply_retry_strategy, should_rotate_account, RetryStrategy};
 
 // ===== 退避策略模块结束 =====
 
@@ -368,6 +238,7 @@ pub async fn handle_messages(
             "/v1/messages",
             &headers,
             new_body,
+            request.messages.len(), // [NEW v4.0.0] Pass message count
         )
         .await;
     }
@@ -492,6 +363,8 @@ pub async fn handle_messages(
     let mut last_error = String::new();
     let retried_without_thinking = false;
     let mut last_email: Option<String> = None;
+    let mut last_mapped_model: Option<String> = None;
+    let mut last_status = StatusCode::SERVICE_UNAVAILABLE; // Default to 503 if no response reached
     
     for attempt in 0..max_attempts {
         // 2. 模型路由解析
@@ -499,6 +372,7 @@ pub async fn handle_messages(
             &request_for_body.model,
             &*state.custom_mapping.read().await,
         );
+        last_mapped_model = Some(mapped_model.clone());
         
         // 将 Claude 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = request_for_body.tools.as_ref().map(|list| {
@@ -527,8 +401,12 @@ pub async fn handle_messages(
                 } else {
                     e
                 };
+                let headers = [
+                    ("X-Mapped-Model", mapped_model.as_str()),
+                ];
                  return (
                     StatusCode::SERVICE_UNAVAILABLE,
+                    headers,
                     Json(json!({
                         "type": "error",
                         "error": {
@@ -592,13 +470,14 @@ pub async fn handle_messages(
 
         // ===== [3-Layer Progressive Compression + Calibrated Estimation] Context Management =====
         // [ENHANCED] 整合 3.3.47 的三层压缩框架 + PR #925 的动态校准机制
+        // [NEW] 只有当 scaling_enabled 为 true 时才执行压缩逻辑 (联动机制)
         // Layer 1 (60%): Tool message trimming - Does NOT break cache
         // Layer 2 (75%): Thinking purification - Breaks cache but preserves signatures
         // Layer 3 (90%): Fork conversation + XML summary - Ultimate optimization
         let mut is_purified = false;
         let mut compression_applied = false;
         
-        if !retried_without_thinking {
+        if !retried_without_thinking && scaling_enabled {  // 新增 scaling_enabled 联动判断
             // 1. Determine context limit (Flash: ~1M, Pro: ~2M)
             let context_limit = if mapped_model.contains("flash") {
                 1_000_000
@@ -757,8 +636,13 @@ pub async fn handle_messages(
                 b
             },
             Err(e) => {
+                 let headers = [
+                    ("X-Mapped-Model", request_with_mapped.model.as_str()),
+                    ("X-Account-Email", email.as_str()),
+                ];
                  return (
                     StatusCode::INTERNAL_SERVER_ERROR,
+                    headers,
                     Json(json!({
                         "type": "error",
                         "error": {
@@ -802,6 +686,7 @@ pub async fn handle_messages(
         };
         
         let status = response.status();
+        last_status = status;
         
         // 成功
         if status.is_success() {
@@ -816,6 +701,7 @@ pub async fn handle_messages(
                 let stream = response.bytes_stream();
                 let gemini_stream = Box::pin(stream);
 
+                let current_message_count = request_with_mapped.messages.len();
 
                 // [FIX #530/#529/#859] Enhanced Peek logic to handle heartbeats and slow start
                 // We must pre-read until we find a MEANINGFUL content block (like message_start).
@@ -827,7 +713,8 @@ pub async fn handle_messages(
                     Some(session_id_str.clone()),
                     scaling_enabled,
                     context_limit,
-                    Some(raw_estimated) // [FIX] Pass estimated tokens for calibrator learning
+                    Some(raw_estimated), // [FIX] Pass estimated tokens for calibrator learning
+                    current_message_count, // [NEW v4.0.0] Pass message count for rewind detection
                 );
 
                 let mut first_data_chunk = None;
@@ -964,7 +851,15 @@ pub async fn handle_messages(
                 // 转换
                 // [FIX #765] Pass session_id and model_name for signature caching
                 let s_id_owned = session_id.map(|s| s.to_string());
-                let claude_response = match transform_response(&gemini_response, scaling_enabled, context_limit, s_id_owned, request_with_mapped.model.clone()) {
+                // 转换
+                let claude_response = match transform_response(
+                    &gemini_response,
+                    scaling_enabled,
+                    context_limit,
+                    s_id_owned,
+                    request_with_mapped.model.clone(),
+                    request_with_mapped.messages.len(), // [NEW v4.0.0] Pass message count for rewind detection
+                ) {
                     Ok(r) => r,
                     Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Transform error: {}", e)).into_response(),
                 };
@@ -991,6 +886,7 @@ pub async fn handle_messages(
         
         // 1. 立即提取状态码和 headers（防止 response 被 move）
         let status_code = status.as_u16();
+        last_status = status;
         let retry_after = response.headers().get("Retry-After").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
         
         // 2. 获取错误文本并转移 Response 所有权
@@ -1012,7 +908,6 @@ pub async fn handle_messages(
                 || error_text.contains("thinking.thinking: Field required")
                 || error_text.contains("thinking.signature")
                 || error_text.contains("thinking.thinking")
-                || error_text.contains("INVALID_ARGUMENT")
                 || error_text.contains("Corrupted thought signature")
                 || error_text.contains("failed to deserialise")
                 || error_text.contains("Invalid signature")
@@ -1077,6 +972,7 @@ pub async fn handle_messages(
                             _ => new_blocks.push(block),
                         }
                     }
+                    *blocks = new_blocks;
                 }
             }
             
@@ -1100,8 +996,9 @@ pub async fn handle_messages(
             // [FIX] 强制重试：因为我们已经清理了 thinking block，所以这是一个新的、可以重试的请求
             // 不要使用 determine_retry_strategy，因为它会因为 retried_without_thinking=true 而返回 NoRetry
             if apply_retry_strategy(
-                RetryStrategy::FixedDelay(Duration::from_millis(100)), 
+                RetryStrategy::FixedDelay(Duration::from_millis(200)), 
                 attempt, 
+                max_attempts,
                 status_code, 
                 &trace_id
             ).await {
@@ -1118,7 +1015,7 @@ pub async fn handle_messages(
         let strategy = determine_retry_strategy(status_code, &error_text, retried_without_thinking);
         
         // 执行退避
-        if apply_retry_strategy(strategy, attempt, status_code, &trace_id).await {
+        if apply_retry_strategy(strategy, attempt, max_attempts, status_code, &trace_id).await {
             // 判断是否需要轮换账号
             if !should_rotate_account(status_code) {
                 debug!("[{}] Keeping same account for status {} (server-side issue)", trace_id, status_code);
@@ -1148,20 +1045,58 @@ pub async fn handle_messages(
         }
     }
     
+    
     if let Some(email) = last_email {
-        (StatusCode::TOO_MANY_REQUESTS, [("X-Account-Email", email)], Json(json!({
+        // [FIX] Include X-Mapped-Model in exhaustion error
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Account-Email", header::HeaderValue::from_str(&email).unwrap());
+        if let Some(model) = last_mapped_model {
+             if let Ok(v) = header::HeaderValue::from_str(&model) {
+                headers.insert("X-Mapped-Model", v);
+             }
+        }
+
+        let error_type = match last_status.as_u16() {
+            400 => "invalid_request_error",
+            401 => "authentication_error",
+            403 => "permission_error",
+            429 => "rate_limit_error",
+            529 => "overloaded_error",
+            _ => "api_error",
+        };
+
+        (last_status, headers, Json(json!({
             "type": "error",
             "error": {
-                "type": "overloaded_error",
-                "message": format!("All {} attempts failed. Last error: {}", max_attempts, last_error)
+                "id": "err_retry_exhausted",
+                "type": error_type,
+                "message": format!("All {} attempts failed. Last status: {}. Error: {}", max_attempts, last_status, last_error)
             }
         }))).into_response()
     } else {
-        (StatusCode::TOO_MANY_REQUESTS, Json(json!({
+        // Fallback if no email (e.g. mapping error before token)
+        let mut headers = HeaderMap::new();
+        if let Some(model) = last_mapped_model {
+             if let Ok(v) = header::HeaderValue::from_str(&model) {
+                headers.insert("X-Mapped-Model", v);
+             }
+        }
+        
+        let error_type = match last_status.as_u16() {
+            400 => "invalid_request_error",
+            401 => "authentication_error",
+            403 => "permission_error",
+            429 => "rate_limit_error",
+            529 => "overloaded_error",
+            _ => "api_error",
+        };
+
+        (last_status, headers, Json(json!({
             "type": "error",
             "error": {
-                "type": "overloaded_error",
-                "message": format!("All {} attempts failed. Last error: {}", max_attempts, last_error)
+                "id": "err_retry_exhausted",
+                "type": error_type,
+                "message": format!("All {} attempts failed. Last status: {}. Error: {}", max_attempts, last_status, last_error)
             }
         }))).into_response()
     }
@@ -1206,6 +1141,7 @@ pub async fn handle_count_tokens(
             "/v1/messages/count_tokens",
             &headers,
             body,
+            0, // [NEW v4.0.0] Tokens count doesn't need rewind detection
         )
         .await;
     }

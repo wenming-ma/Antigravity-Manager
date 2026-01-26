@@ -5,6 +5,7 @@ pub mod models;
 pub mod request;
 pub mod response;
 pub mod streaming;
+pub mod collector; // [NEW]
 
 pub use models::*;
 pub use request::*;

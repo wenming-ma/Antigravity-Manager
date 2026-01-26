@@ -327,7 +327,21 @@ pub fn sync_config(app: &CliApp, proxy_url: &str, api_key: &str) -> Result<(), S
                     let env = json.as_object_mut().unwrap().entry("env").or_insert(serde_json::json!({}));
                     if let Some(env_obj) = env.as_object_mut() {
                         env_obj.insert("ANTHROPIC_BASE_URL".to_string(), Value::String(proxy_url.to_string()));
-                        env_obj.insert("ANTHROPIC_API_KEY".to_string(), Value::String(api_key.to_string()));
+                        if !api_key.is_empty() {
+                            env_obj.insert("ANTHROPIC_API_KEY".to_string(), Value::String(api_key.to_string()));
+                            
+                            // [FIX] 避免冲突：如果存在则移除 ANTHROPIC_AUTH_TOKEN
+                            env_obj.remove("ANTHROPIC_AUTH_TOKEN");
+
+                            // [FIX] 清理可能来自其他 Provider 的模型覆盖设置
+                            env_obj.remove("ANTHROPIC_MODEL");
+                            env_obj.remove("ANTHROPIC_DEFAULT_HAIKU_MODEL");
+                            env_obj.remove("ANTHROPIC_DEFAULT_OPUS_MODEL");
+                            env_obj.remove("ANTHROPIC_DEFAULT_SONNET_MODEL");
+                        } else {
+                            // 如果 API Key 为空，则移除该键，避免设置为空字符串
+                            env_obj.remove("ANTHROPIC_API_KEY");
+                        }
                     }
                     content = serde_json::to_string_pretty(&json).unwrap();
                 }

@@ -14,7 +14,9 @@ import { useConfigStore } from './stores/useConfigStore';
 import { useAccountStore } from './stores/useAccountStore';
 import { useTranslation } from 'react-i18next';
 import { listen } from '@tauri-apps/api/event';
-import { invoke } from '@tauri-apps/api/core';
+import { isTauri } from './utils/env';
+import { request as invoke } from './utils/request';
+import { AdminAuthGuard } from './components/common/AdminAuthGuard';
 
 const router = createBrowserRouter([
   {
@@ -67,6 +69,7 @@ function App() {
 
   // Listen for tray events
   useEffect(() => {
+    if (!isTauri()) return;
     const unlistenPromises: Promise<() => void>[] = [];
 
     // 监听托盘切换账号事件
@@ -124,13 +127,13 @@ function App() {
   }, []);
 
   return (
-    <>
+    <AdminAuthGuard>
       <ThemeManager />
       {showUpdateNotification && (
         <UpdateNotification onClose={() => setShowUpdateNotification(false)} />
       )}
       <RouterProvider router={router} />
-    </>
+    </AdminAuthGuard>
   );
 }
 

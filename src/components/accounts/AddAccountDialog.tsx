@@ -1,11 +1,13 @@
 import { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { Plus, Database, Globe, FileClock, Loader2, CheckCircle2, XCircle, Copy, Check } from 'lucide-react';
+import { Plus, Database, Globe, FileClock, Loader2, CheckCircle2, XCircle, Copy, Check, Info } from 'lucide-react';
 import { useAccountStore } from '../../stores/useAccountStore';
 import { useTranslation } from 'react-i18next';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import { request as invoke } from '../../utils/request';
+import { isTauri } from '../../utils/env';
+import { copyToClipboard } from '../../utils/clipboard';
 
 interface AddAccountDialogProps {
     onAdd: (email: string, refreshToken: string) => Promise<void>;
@@ -15,8 +17,9 @@ type Status = 'idle' | 'loading' | 'success' | 'error';
 
 function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
     const { t } = useTranslation();
+    const fetchAccounts = useAccountStore(state => state.fetchAccounts);
     const [isOpen, setIsOpen] = useState(false);
-    const [activeTab, setActiveTab] = useState<'oauth' | 'token' | 'import'>('oauth');
+    const [activeTab, setActiveTab] = useState<'oauth' | 'token' | 'import'>(isTauri() ? 'oauth' : 'token');
     const [refreshToken, setRefreshToken] = useState('');
     const [oauthUrl, setOauthUrl] = useState('');
     const [oauthUrlCopied, setOauthUrlCopied] = useState(false);
@@ -48,6 +51,7 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
 
     // Listen for OAuth URL
     useEffect(() => {
+        if (!isTauri()) return;
         let unlisten: (() => void) | undefined;
 
         const setupListener = async () => {
@@ -66,6 +70,7 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
 
     // Listen for OAuth callback completion (user may open the URL manually without clicking Start)
     useEffect(() => {
+        if (!isTauri()) return;
         let unlisten: (() => void) | undefined;
 
         const setupListener = async () => {
@@ -114,10 +119,10 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
         if (activeTab !== 'oauth') return;
         if (oauthUrl) return;
 
-        invoke<string>('prepare_oauth_url')
-            .then((url) => {
-                // Set directly (also emitted via event), to avoid any race if event is missed.
-                if (typeof url === 'string' && url.length > 0) setOauthUrl(url);
+        invoke<any>('prepare_oauth_url')
+            .then((res) => {
+                const url = typeof res === 'string' ? res : res?.url;
+                if (url && url.length > 0) setOauthUrl(url);
             })
             .catch((e) => {
                 console.error('Failed to prepare OAuth URL:', e);
@@ -267,7 +272,76 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
         }
     };
 
+    const handleOAuthWeb = async () => {
+        try {
+            setStatus('loading');
+            setMessage(t('accounts.add.oauth.btn_start') + '...');
+
+            // 1. 获取 URL (指向 /auth/callback)
+            const res = await invoke<any>('prepare_oauth_url');
+            const url = typeof res === 'string' ? res : res.url;
+
+            if (!url) {
+                throw new Error('Could not obtain OAuth URL');
+            }
+
+            setOauthUrl(url); // 确保链接在 UI 中可见，方便用户手动复制
+
+            // 2. 打开新标签页 (响应用户反馈：Web 端直接使用新标签体验更好)
+            const popup = window.open(url, '_blank');
+
+            if (!popup) {
+                setStatus('error');
+                setMessage(t('common.error') + ': Popup blocked');
+                return;
+            }
+
+            // 3. 监听消息
+            const handleMessage = async (event: MessageEvent) => {
+                // 安全检查: 如果定义了 ORIGIN 校验更好，这里暂时检查 data type
+                if (event.data?.type === 'oauth-success') {
+                    popup.close();
+                    window.removeEventListener('message', handleMessage);
+
+                    // 4. 成功后刷新列表
+                    await fetchAccounts();
+
+                    setStatus('success');
+                    setMessage(t('accounts.add.oauth_success') || t('common.success'));
+
+                    setTimeout(() => {
+                        setIsOpen(false);
+                        resetState();
+                    }, 1500);
+                }
+            };
+
+            window.addEventListener('message', handleMessage);
+
+            // 5. 检测窗口关闭 (用户手动关闭)
+            const timer = setInterval(() => {
+                if (popup.closed) {
+                    clearInterval(timer);
+                    window.removeEventListener('message', handleMessage);
+                    if (statusRef.current === 'loading') { // 如果还在 loading 状态就关闭了，说明取消了
+                        setStatus('idle');
+                        setMessage('');
+                    }
+                }
+            }, 1000);
+
+        } catch (error) {
+            console.error('OAuth Web Error:', error);
+            setStatus('error');
+            setMessage(`${t('common.error')}: ${error}`);
+        }
+    };
+
     const handleOAuth = () => {
+        if (!isTauri()) {
+            handleOAuthWeb();
+            return;
+        }
         // Default flow: opens the default browser and completes automatically.
         // (If user opened the URL manually, completion is also triggered by oauth-callback-received.)
         handleAction(t('accounts.add.tabs.oauth'), startOAuthLogin, { clearOauthUrl: false });
@@ -280,12 +354,10 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
 
     const handleCopyUrl = async () => {
         if (oauthUrl) {
-            try {
-                await navigator.clipboard.writeText(oauthUrl);
+            const success = await copyToClipboard(oauthUrl);
+            if (success) {
                 setOauthUrlCopied(true);
                 window.setTimeout(() => setOauthUrlCopied(false), 1500);
-            } catch (err) {
-                console.error('Failed to copy: ', err);
             }
         }
     };
@@ -300,6 +372,10 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
 
     const handleImportCustomDb = async () => {
         try {
+            if (!isTauri()) {
+                alert(t('common.tauri_api_not_loaded') || 'Storage import only works in desktop app.');
+                return;
+            }
             const selected = await open({
                 multiple: false,
                 filters: [{
@@ -357,7 +433,7 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
             </button>
 
             {isOpen && createPortal(
-                <div 
+                <div
                     className="fixed inset-0 z-[99999] flex items-center justify-center bg-black/50 backdrop-blur-sm"
                     style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0 }}
                 >
@@ -371,6 +447,7 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
                         <h3 className="font-bold text-lg mb-4">{t('accounts.add.title')}</h3>
 
                         {/* Tab 导航 - 胶囊风格 */}
+
                         <div className="bg-gray-100 dark:bg-base-200 p-1 rounded-xl mb-6 grid grid-cols-3 gap-1">
                             <button
                                 className={`py-2 px-3 rounded-lg text-sm font-medium transition-all duration-200 ${activeTab === 'oauth'
@@ -400,6 +477,14 @@ function AddAccountDialog({ onAdd }: AddAccountDialogProps) {
                                 {t('accounts.add.tabs.import')}
                             </button>
                         </div>
+
+                        {/* 添加 Web 模式提示 */}
+                        {!isTauri() && (
+                            <div className="alert alert-info mb-4 text-xs py-2 flex items-center gap-2 bg-blue-50 dark:bg-blue-900/10 text-blue-600 dark:text-blue-400 border-blue-100 dark:border-blue-800">
+                                <Info className="w-4 h-4" />
+                                <span>{t('accounts.add.oauth.web_hint', '将在新窗口中打开 Google 登录页')}</span>
+                            </div>
+                        )}
 
                         {/* 状态提示区 */}
                         <StatusAlert />

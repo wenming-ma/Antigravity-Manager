@@ -777,19 +777,13 @@ fn build_system_instruction(system: &Option<SystemPrompt>, _model_name: &str, ha
             SystemPrompt::String(text) => {
                 // [MODIFIED] No longer filter "You are an interactive CLI tool"
                 // We pass everything through to ensure Flash/Lite models get full instructions
-                // [FIX] Skip empty/whitespace-only text blocks
-                if !text.trim().is_empty() {
-                    parts.push(json!({"text": text}));
-                }
+                parts.push(json!({"text": text}));
             }
             SystemPrompt::Array(blocks) => {
                 for block in blocks {
                     if block.block_type == "text" {
                         // [MODIFIED] No longer filter "You are an interactive CLI tool"
-                        // [FIX] Skip empty/whitespace-only text blocks
-                        if !block.text.trim().is_empty() {
-                            parts.push(json!({"text": block.text}));
-                        }
+                        parts.push(json!({"text": block.text}));
                     }
                 }
             }
@@ -848,19 +842,17 @@ fn build_contents(
 
     match content {
         MessageContent::String(text) => {
-            // [FIX] Skip empty/whitespace-only text blocks to avoid upstream API rejection
-            // Error: "messages: text content blocks must contain non-whitespace text"
-            if text != "(no content)" && !text.trim().is_empty() {
-                parts.push(json!({"text": text.trim()}));
+            if text != "(no content)" {
+                if !text.trim().is_empty() {
+                    parts.push(json!({"text": text.trim()}));
+                }
             }
         }
         MessageContent::Array(blocks) => {
             for item in blocks {
                 match item {
                     ContentBlock::Text { text } => {
-                        // [FIX] Skip empty/whitespace-only text blocks to avoid upstream API rejection
-                        // Error: "messages: text content blocks must contain non-whitespace text"
-                        if text != "(no content)" && !text.trim().is_empty() {
+                        if text != "(no content)" {
                             // [NEW] 任务去重逻辑: 如果当前是 User 消息，且紧跟在 ToolResult 之后，
                             // 检查该文本是否与上一轮任务描述完全一致。
                             if !is_assistant && *previous_was_tool_result {
@@ -1051,9 +1043,6 @@ fn build_contents(
                         if is_assistant {
                             pending_tool_use_ids.push(id.clone());
                         }
-
-                        // [New] 递归清理参数中可能存在的非法校验字段
-                        crate::proxy::common::json_schema::clean_json_schema(&mut part);
 
                         // 存储 id -> name 映射
                         tool_id_to_name.insert(id.clone(), name.clone());

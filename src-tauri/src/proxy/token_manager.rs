@@ -1351,12 +1351,14 @@ impl TokenManager {
     /// - `model`: 可选的模型名称,用于模型级别限流。传入实际使用的模型可以避免不同模型配额互相影响
     pub async fn mark_rate_limited_async(
         &self,
-        account_id: &str,
+        email: &str,
         status: u16,
         retry_after_header: Option<&str>,
         error_body: &str,
         model: Option<&str>,  // 🆕 新增模型参数
     ) {
+        // [FIX] Convert email to account_id for consistent tracking
+        let account_id = self.email_to_account_id(email).unwrap_or_else(|| email.to_string());
         // 检查 API 是否返回了精确的重试时间
         let has_explicit_retry_time = retry_after_header.is_some() || 
             error_body.contains("quotaResetDelay");
@@ -1369,7 +1371,7 @@ impl TokenManager {
                 tracing::debug!("账号 {} 的 429 响应包含 quotaResetDelay,直接使用 API 返回的时间", account_id);
             }
             self.rate_limit_tracker.parse_from_error(
-                account_id,
+                &account_id,
                 status,
                 retry_after_header,
                 error_body,
@@ -1394,13 +1396,13 @@ impl TokenManager {
             tracing::info!("账号 {} 的 429 响应未包含 quotaResetDelay,尝试实时刷新配额...", account_id);
         }
         
-        if self.fetch_and_lock_with_realtime_quota(account_id, reason, model.map(|s| s.to_string())).await {
+        if self.fetch_and_lock_with_realtime_quota(&account_id, reason, model.map(|s| s.to_string())).await {
             tracing::info!("账号 {} 已使用实时配额精确锁定", account_id);
             return;
         }
         
         // 实时刷新失败,尝试使用本地缓存的配额刷新时间
-        if self.set_precise_lockout(account_id, reason, model.map(|s| s.to_string())) {
+        if self.set_precise_lockout(&account_id, reason, model.map(|s| s.to_string())) {
             tracing::info!("账号 {} 已使用本地缓存配额锁定", account_id);
             return;
         }
@@ -1408,7 +1410,7 @@ impl TokenManager {
         // 都失败了,回退到指数退避策略
         tracing::warn!("账号 {} 无法获取配额刷新时间,使用指数退避策略", account_id);
         self.rate_limit_tracker.parse_from_error(
-            account_id,
+            &account_id,
             status,
             retry_after_header,
             error_body,
@@ -1458,6 +1460,110 @@ impl TokenManager {
     /// 获取当前优先使用的账号ID
     pub async fn get_preferred_account(&self) -> Option<String> {
         self.preferred_account_id.read().await.clone()
+    }
+
+    /// 使用 Authorization Code 交换 Refresh Token (Web OAuth)
+    pub async fn exchange_code(&self, code: &str, redirect_uri: &str) -> Result<String, String> {
+        crate::modules::oauth::exchange_code(code, redirect_uri).await
+            .and_then(|t| t.refresh_token.ok_or_else(|| "No refresh token returned by Google".to_string()))
+    }
+
+    /// 获取 OAuth URL (支持自定义 Redirect URI)
+    pub fn get_oauth_url_with_redirect(&self, redirect_uri: &str) -> String {
+        crate::modules::oauth::get_auth_url(redirect_uri)
+    }
+
+    /// 获取用户信息 (Email 等)
+    pub async fn get_user_info(&self, refresh_token: &str) -> Result<crate::modules::oauth::UserInfo, String> {
+        // 先获取 Access Token
+        let token = crate::modules::oauth::refresh_access_token(refresh_token).await
+            .map_err(|e| format!("刷新 Access Token 失败: {}", e))?;
+            
+        crate::modules::oauth::get_user_info(&token.access_token).await
+    }
+
+    /// 添加新账号 (纯后端实现，不依赖 Tauri AppHandle)
+    pub async fn add_account(&self, email: &str, refresh_token: &str) -> Result<(), String> {
+         // 1. 获取 Access Token (验证 refresh_token 有效性)
+        let token_info = crate::modules::oauth::refresh_access_token(refresh_token)
+            .await
+            .map_err(|e| format!("Invalid refresh token: {}", e))?;
+
+        // 2. 获取项目 ID (Project ID)
+        let project_id = crate::proxy::project_resolver::fetch_project_id(&token_info.access_token)
+            .await
+            .unwrap_or_else(|_| "bamboo-precept-lgxtn".to_string()); // Fallback
+
+        // 3. 生成账号 ID
+        // 为保持一致性，使用 md5(email) ? 或者 uuid?
+        // 查看 modules/account.rs，它是用 uuid (或者 hash). 
+        // 实际上 account.rs 使用 Uuid::new_v4().to_string() 或者是 md5(email) 
+        // 为了避免重复，最好先判断 email 是否已存在。
+        
+        let existing_id = self.get_account_id_by_email(email);
+        let account_id = existing_id.unwrap_or_else(|| {
+             uuid::Uuid::new_v4().to_string()
+        });
+
+        // 4. 构建账号数据结构 (JSON)
+        // 参考 modules/account.rs 的 Account 结构
+        // 这里手动构建 JSON Value 比较简单
+        
+        let now = chrono::Utc::now().timestamp();
+        
+        let account_json = serde_json::json!({
+            "id": account_id,
+            "email": email,
+            "name": email.split('@').next().unwrap_or("User"),
+            "token": {
+                "access_token": token_info.access_token,
+                "refresh_token": refresh_token,
+                "expires_in": token_info.expires_in,
+                "expiry_timestamp": now + token_info.expires_in,
+                "project_id": project_id
+            },
+            "quota": {
+                "models": [],
+                "last_updated": 0,
+                "subscription_tier": "FREE",
+                "is_forbidden": false
+            },
+            "device_profile": null,
+            "disabled": false,
+            "created_at": now,
+            "last_used": now // [FIX] 新账号默认为 recently used
+        });
+
+        // 5. 写入文件
+        let accounts_dir = self.data_dir.join("accounts");
+        if !accounts_dir.exists() {
+             std::fs::create_dir_all(&accounts_dir).map_err(|e| e.to_string())?;
+        }
+        
+        let file_path = accounts_dir.join(format!("{}.json", account_id));
+        let content = serde_json::to_string_pretty(&account_json).map_err(|e| e.to_string())?;
+        
+        tokio::fs::write(&file_path, content).await
+            .map_err(|e| format!("Failed to write account file: {}", e))?;
+            
+        // 6. 重新加载 (更新内存)
+        self.load_single_account(&file_path).await.map(|opt| {
+             if let Some(token) = opt {
+                 self.tokens.insert(account_id, token);
+             }
+        }).map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+    
+    /// 根据 Email 查找账号 ID
+    pub fn get_account_id_by_email(&self, email: &str) -> Option<String> {
+        for entry in self.tokens.iter() {
+            if entry.value().email == email {
+                return Some(entry.key().clone());
+            }
+        }
+        None
     }
 }
 

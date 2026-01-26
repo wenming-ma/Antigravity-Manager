@@ -2,11 +2,11 @@ use tauri::{
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
-    Manager, Runtime, Emitter, Listener,
+    Manager, Emitter, Listener,
 };
 use crate::modules;
 
-pub fn create_tray<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
+pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     // 1. Load config to get language settings
     let config = modules::load_app_config().unwrap_or_default();
     let texts = modules::i18n::get_tray_texts(&config.language);
@@ -112,7 +112,10 @@ pub fn create_tray<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
                              };
                              
                              // 2. Switch
-                             if let Ok(_) = modules::switch_account(&next_account.id).await {
+                             let integration = crate::modules::integration::DesktopIntegration {
+                                 app_handle: app_handle.clone(),
+                             };
+                             if let Ok(_) = modules::switch_account(&next_account.id, &integration).await {
                                  // 3. Notify frontend
                                  let _ = app_handle.emit("tray://account-switched", next_account.id.clone());
                                  // 4. Update tray
@@ -158,7 +161,7 @@ pub fn create_tray<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
 }
 
 /// Helper function to update tray menu
-pub fn update_tray_menus<R: Runtime>(app: &tauri::AppHandle<R>) {
+pub fn update_tray_menus(app: &tauri::AppHandle) {
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
          // Read config to get language
@@ -230,7 +233,7 @@ pub fn update_tray_menus<R: Runtime>(app: &tauri::AppHandle<R>) {
              let sep2 = PredefinedMenuItem::separator(&app_clone).ok();
              let sep3 = PredefinedMenuItem::separator(&app_clone).ok();
              
-             let mut items: Vec<&dyn tauri::menu::IsMenuItem<R>> = vec![&i_u];
+             let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&i_u];
              // Add dynamic quota items
              for item in &quota_items {
                  items.push(item);

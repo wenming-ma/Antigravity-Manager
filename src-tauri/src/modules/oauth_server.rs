@@ -40,8 +40,7 @@ fn oauth_fail_html() -> &'static str {
     </html>"
 }
 
-async fn ensure_oauth_flow_prepared(app_handle: &tauri::AppHandle) -> Result<String, String> {
-    use tauri::Emitter;
+async fn ensure_oauth_flow_prepared(app_handle: Option<tauri::AppHandle>) -> Result<String, String> {
 
     // Return URL if flow already exists
     if let Ok(state) = get_oauth_flow_state().lock() {
@@ -175,7 +174,10 @@ async fn ensure_oauth_flow_prepared(app_handle: &tauri::AppHandle) -> Result<Str
                 let _ = stream.flush().await;
 
                 if let Some(sender) = tx.lock().await.take() {
-                    let _ = app_handle.emit("oauth-callback-received", ());
+                    if let Some(h) = app_handle {
+                        use tauri::Emitter;
+                        let _ = h.emit("oauth-callback-received", ());
+                    }
                     let _ = sender.send(result);
                 }
             }
@@ -230,7 +232,10 @@ async fn ensure_oauth_flow_prepared(app_handle: &tauri::AppHandle) -> Result<Str
                 let _ = stream.flush().await;
 
                 if let Some(sender) = tx.lock().await.take() {
-                    let _ = app_handle.emit("oauth-callback-received", ());
+                    if let Some(h) = app_handle {
+                        use tauri::Emitter;
+                        let _ = h.emit("oauth-callback-received", ());
+                    }
                     let _ = sender.send(result);
                 }
             }
@@ -248,14 +253,17 @@ async fn ensure_oauth_flow_prepared(app_handle: &tauri::AppHandle) -> Result<Str
     }
 
     // Send event to frontend (for display/copying link)
-    let _ = app_handle.emit("oauth-url-generated", &auth_url);
+    if let Some(h) = app_handle {
+        use tauri::Emitter;
+        let _ = h.emit("oauth-url-generated", &auth_url);
+    }
 
     Ok(auth_url)
 }
 
 /// Pre-generate OAuth URL (does not open browser, does not block waiting for callback)
-pub async fn prepare_oauth_url(app_handle: tauri::AppHandle) -> Result<String, String> {
-    ensure_oauth_flow_prepared(&app_handle).await
+pub async fn prepare_oauth_url(app_handle: Option<tauri::AppHandle>) -> Result<String, String> {
+    ensure_oauth_flow_prepared(app_handle).await
 }
 
 /// Cancel current OAuth flow
@@ -269,16 +277,17 @@ pub fn cancel_oauth_flow() {
 }
 
 /// Start OAuth flow and wait for callback, then exchange token
-pub async fn start_oauth_flow(app_handle: tauri::AppHandle) -> Result<oauth::TokenResponse, String> {
+pub async fn start_oauth_flow(app_handle: Option<tauri::AppHandle>) -> Result<oauth::TokenResponse, String> {
     // Ensure URL + listener are ready (this way if the user authorizes first, it won't get stuck)
-    let auth_url = ensure_oauth_flow_prepared(&app_handle).await?;
+    let auth_url = ensure_oauth_flow_prepared(app_handle.clone()).await?;
 
-    // Open default browser
-    use tauri_plugin_opener::OpenerExt;
-    app_handle
-        .opener()
-        .open_url(&auth_url, None::<String>)
-        .map_err(|e| format!("failed_to_open_browser: {}", e))?;
+    if let Some(h) = app_handle {
+        // Open default browser
+        use tauri_plugin_opener::OpenerExt;
+        h.opener()
+            .open_url(&auth_url, None::<String>)
+            .map_err(|e| format!("failed_to_open_browser: {}", e))?;
+    }
 
     // Take code_rx to wait for it
     let (code_rx, redirect_uri) = {
@@ -313,9 +322,9 @@ pub async fn start_oauth_flow(app_handle: tauri::AppHandle) -> Result<oauth::Tok
 /// Завершить OAuth flow без открытия браузера.
 /// Предполагается, что пользователь открыл ссылку вручную (или ранее была открыта),
 /// а мы только ждём callback и обмениваем code на token.
-pub async fn complete_oauth_flow(app_handle: tauri::AppHandle) -> Result<oauth::TokenResponse, String> {
+pub async fn complete_oauth_flow(app_handle: Option<tauri::AppHandle>) -> Result<oauth::TokenResponse, String> {
     // Ensure URL + listeners exist
-    let _ = ensure_oauth_flow_prepared(&app_handle).await?;
+    let _ = ensure_oauth_flow_prepared(app_handle).await?;
 
     // Take receiver to wait for code
     let (code_rx, redirect_uri) = {

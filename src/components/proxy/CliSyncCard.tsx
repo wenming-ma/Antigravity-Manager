@@ -14,6 +14,7 @@ import {
     Copy,
     X
 } from 'lucide-react';
+import { copyToClipboard } from '../../utils/clipboard';
 import { request as invoke } from '../../utils/request';
 import { showToast } from '../common/ToastContainer';
 import ModalDialog from '../common/ModalDialog';
@@ -321,9 +322,11 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                             </div>
                             <div className="flex items-center gap-2">
                                 <button
-                                    onClick={() => {
-                                        navigator.clipboard.writeText(viewingConfig.content);
-                                        showToast(t('proxy.cli_sync.modal.copy_success'), 'success');
+                                    onClick={async () => {
+                                        const success = await copyToClipboard(viewingConfig.content);
+                                        if (success) {
+                                            showToast(t('proxy.cli_sync.modal.copy_success'), 'success');
+                                        }
                                     }}
                                     className="btn btn-ghost btn-sm hover:bg-blue-50 hover:text-blue-600 dark:hover:bg-blue-900/20"
                                 >

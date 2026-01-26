@@ -13,59 +13,8 @@ use crate::proxy::server::AppState;
 
 const MAX_RETRY_ATTEMPTS: usize = 3;
 use crate::proxy::session_manager::SessionManager;
-use tokio::time::{sleep, Duration};
-
-/// 重试策略枚举
-#[derive(Debug, Clone)]
-enum RetryStrategy {
-    NoRetry,
-    FixedDelay(Duration),
-    LinearBackoff { base_ms: u64 },
-    ExponentialBackoff { base_ms: u64, max_ms: u64 },
-}
-
-fn determine_retry_strategy(status_code: u16, error_text: &str) -> RetryStrategy {
-    match status_code {
-        429 => {
-            if let Some(delay_ms) = crate::proxy::upstream::retry::parse_retry_delay(error_text) {
-                let actual_delay = delay_ms.saturating_add(200).min(10_000);
-                RetryStrategy::FixedDelay(Duration::from_millis(actual_delay))
-            } else {
-                RetryStrategy::LinearBackoff { base_ms: 1000 }
-            }
-        }
-        503 | 529 => RetryStrategy::ExponentialBackoff { base_ms: 1000, max_ms: 8000 },
-        500 => RetryStrategy::LinearBackoff { base_ms: 500 },
-        401 | 403 => RetryStrategy::FixedDelay(Duration::from_millis(100)),
-        _ => RetryStrategy::NoRetry,
-    }
-}
-
-async fn apply_retry_strategy(strategy: RetryStrategy, attempt: usize, status_code: u16, trace_id: &str) -> bool {
-    match strategy {
-        RetryStrategy::NoRetry => {
-            debug!("[{}] Non-retryable error {}, stopping", trace_id, status_code);
-            false
-        }
-        RetryStrategy::FixedDelay(duration) => {
-            info!("[{}] ⏱️ Retry with fixed delay: status={}, attempt={}/{}", trace_id, status_code, attempt + 1, MAX_RETRY_ATTEMPTS);
-            sleep(duration).await;
-            true
-        }
-        RetryStrategy::LinearBackoff { base_ms } => {
-            let delay = base_ms * (attempt as u64 + 1);
-            info!("[{}] ⏱️ Retry with linear backoff: status={}, attempt={}/{}", trace_id, status_code, attempt + 1, MAX_RETRY_ATTEMPTS);
-            sleep(Duration::from_millis(delay)).await;
-            true
-        }
-        RetryStrategy::ExponentialBackoff { base_ms, max_ms } => {
-             let delay = (base_ms * 2_u64.pow(attempt as u32)).min(max_ms);
-             info!("[{}] ⏱️ Retry with exponential backoff: status={}, attempt={}/{}", trace_id, status_code, attempt + 1, MAX_RETRY_ATTEMPTS);
-             sleep(Duration::from_millis(delay)).await;
-             true
-        }
-    }
-}
+use tokio::time::Duration;
+use super::common::{determine_retry_strategy, apply_retry_strategy, should_rotate_account, RetryStrategy};
 
 pub async fn handle_chat_completions(
     State(state): State<AppState>,
@@ -141,12 +90,14 @@ pub async fn handle_chat_completions(
     }
 
     debug!("Received OpenAI request for model: {}", openai_req.model);
+    let trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
 
     // 1. 获取 UpstreamClient (Clone handle)
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
+    // [FIX] Ensure max_attempts is at least 2 to allow for internal retries
+    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size.saturating_add(1)).max(2);
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
@@ -177,15 +128,20 @@ pub async fn handle_chat_completions(
         // 4. 获取 Token (使用准确的 request_type)
         // 关键：在重试尝试 (attempt > 0) 时强制轮换账号
         let (access_token, project_id, email) = match token_manager
-            .get_token(&config.request_type, attempt > 0, Some(&session_id), &openai_req.model)
+            .get_token(&config.request_type, attempt > 0, Some(&session_id), &mapped_model)
             .await
         {
             Ok(t) => t,
             Err(e) => {
-                return Err((
+                // [FIX] Attach headers to error response for logging visibility
+                let headers = [
+                    ("X-Mapped-Model", mapped_model.as_str()),
+                ];
+                return Ok((
                     StatusCode::SERVICE_UNAVAILABLE,
+                    headers,
                     format!("Token error: {}", e),
-                ));
+                ).into_response());
             }
         };
 
@@ -195,8 +151,19 @@ pub async fn handle_chat_completions(
         // 4. 转换请求
         let gemini_body = transform_openai_request(&openai_req, &project_id, &mapped_model);
 
+        // [New] 打印转换后的报文 (Gemini Body) 供调试
+        if let Ok(body_json) = serde_json::to_string_pretty(&gemini_body) {
+            debug!("[OpenAI-Request] Transformed Gemini Body:\n{}", body_json);
+        }
+
         // 5. 发送请求
-        let actual_stream = openai_req.stream;
+        let client_wants_stream = openai_req.stream;
+        let force_stream_internally = !client_wants_stream;
+        let actual_stream = client_wants_stream || force_stream_internally;
+
+        if force_stream_internally {
+            debug!("[{}] 🔄 Auto-converting non-stream request to stream for better quota", trace_id);
+        }
         
         let method = if actual_stream {
             "streamGenerateContent"
@@ -299,7 +266,7 @@ pub async fn handle_chat_completions(
                 })
                 .chain(openai_stream);
                 
-                if actual_stream {
+                if client_wants_stream {
                     // 客户端请求流式，返回 SSE
                     let body = Body::from_stream(combined_stream);
                     return Ok(Response::builder()
@@ -313,9 +280,24 @@ pub async fn handle_chat_completions(
                         .unwrap()
                         .into_response());
                 } else {
-                    // 非流式请求（虽然内部可能走流但这里按原始需求转换）
-                    // 实际上既然实际流已经是 actual_stream 了，这里的逻辑应该一致
-                    unreachable!("actual_stream should be the original stream flag");
+                    // 客户端请求非流式，但内部强制转为流式
+                    // 收集流数据并聚合为 JSON
+                    use crate::proxy::mappers::openai::collector::collect_stream_to_json;
+                    
+                    match collect_stream_to_json(Box::pin(combined_stream)).await {
+                        Ok(full_response) => {
+                            info!("[{}] ✓ Stream collected and converted to JSON", trace_id);
+                            return Ok((
+                                StatusCode::OK, 
+                                [("X-Account-Email", email.as_str()), ("X-Mapped-Model", mapped_model.as_str())], 
+                                Json(full_response)
+                            ).into_response());
+                        },
+                        Err(e) => {
+                            error!("[{}] Stream collection error: {}", trace_id, e);
+                            return Ok((StatusCode::INTERNAL_SERVER_ERROR, format!("Stream collection error: {}", e)).into_response());
+                        }
+                    }
                 }
             }
 
@@ -330,7 +312,7 @@ pub async fn handle_chat_completions(
 
         // 处理特定错误并重试
         let status_code = status.as_u16();
-        let retry_after = response.headers().get("Retry-After").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+        let _retry_after = response.headers().get("Retry-After").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
         let error_text = response.text().await.unwrap_or_else(|_| format!("HTTP {}", status_code));
         last_error = format!("HTTP {}: {}", status_code, error_text);
 
@@ -341,68 +323,35 @@ pub async fn handle_chat_completions(
             error_text
         );
 
-        // 429/529/503 智能处理
-        if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
-            // 记录限流信息 (全局同步)
-            token_manager.mark_rate_limited(&email, status_code, retry_after.as_deref(), &error_text);
+        // 确定重试策略
+        let strategy = determine_retry_strategy(status_code, &error_text, false);
 
-            // 1. 优先尝试解析 RetryInfo (由 Google Cloud 直接下发)
-            if let Some(delay_ms) = crate::proxy::upstream::retry::parse_retry_delay(&error_text) {
-                let actual_delay = delay_ms.saturating_add(200).min(10_000);
-                tracing::warn!(
-                    "OpenAI Upstream {} on {} attempt {}/{}, waiting {}ms then retrying",
-                    status_code,
-                    email,
-                    attempt + 1,
-                    max_attempts,
-                    actual_delay
-                );
-                tokio::time::sleep(tokio::time::Duration::from_millis(actual_delay)).await;
-                continue;
+        // 执行退避
+        if apply_retry_strategy(strategy, attempt, max_attempts, status_code, &trace_id).await {
+            // 判断是否需要轮换账号
+            if !should_rotate_account(status_code) {
+                debug!("[{}] Keeping same account for status {} (server-side issue)", trace_id, status_code);
             }
-
-            // 2. 只有明确包含 "QUOTA_EXHAUSTED" 才停止，避免误判频率提示 (如 "check quota")
-            if error_text.contains("QUOTA_EXHAUSTED") {
-                error!(
-                    "OpenAI Quota exhausted (429) on account {} attempt {}/{}, stopping to protect pool.",
-                    email,
-                    attempt + 1,
-                    max_attempts
-                );
-                return Ok((status, [("X-Account-Email", email.as_str()), ("X-Mapped-Model", mapped_model.as_str())], error_text).into_response());
-            }
-
-            // 3. 其他限流或服务器过载情况，轮换账号
-            tracing::warn!(
-                "OpenAI Upstream {} on {} attempt {}/{}, rotating account",
-                status_code,
-                email,
-                attempt + 1,
-                max_attempts
-            );
             continue;
         }
 
         // [NEW] 处理 400 错误 (Thinking 签名失效)
-        if status_code == 400
+        if status_code == 400 
             && (error_text.contains("Invalid `signature`")
                 || error_text.contains("thinking.signature")
                 || error_text.contains("Invalid signature")
                 || error_text.contains("Corrupted thought signature"))
         {
             tracing::warn!(
-                "[OpenAI] Signature error detected on account {}, clearing invalid signature and retrying",
+                "[OpenAI] Signature error detected on account {}, retrying without thinking",
                 email
             );
-
-            // [FIX] 清除失效的全局签名，避免后续请求继续使用
-            crate::proxy::mappers::openai::streaming::clear_thought_signature();
-
+            
             // 追加修复提示词到最后一条用户消息
             if let Some(last_msg) = openai_req.messages.last_mut() {
                 if last_msg.role == "user" {
                     let repair_prompt = "\n\n[System Recovery] Your previous output contained an invalid signature. Please regenerate the response without the corrupted signature block.";
-
+                    
                     if let Some(content) = &mut last_msg.content {
                         use crate::proxy::mappers::openai::{OpenAIContent, OpenAIContentBlock};
                         match content {
@@ -419,20 +368,21 @@ pub async fn handle_chat_completions(
                     }
                 }
             }
-
+            
             continue; // 重试
         }
 
         // 只有 403 (权限/地区限制) 和 401 (认证失效) 触发账号轮换
         if status_code == 403 || status_code == 401 {
-            tracing::warn!(
-                "OpenAI Upstream {} on account {} attempt {}/{}, rotating account",
+            if apply_retry_strategy(
+                RetryStrategy::FixedDelay(Duration::from_millis(200)),
+                attempt,
+                max_attempts,
                 status_code,
-                email,
-                attempt + 1,
-                max_attempts
-            );
-            continue;
+                &trace_id
+            ).await {
+                continue;
+            }
         }
 
         // 404 等由于模型配置或路径错误的 HTTP 异常，直接报错，不进行无效轮换
@@ -534,10 +484,7 @@ pub async fn handle_completions(
                             for part in parts {
                                 // 处理文本块
                                 if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                    // [FIX] Skip empty/whitespace-only text to avoid upstream API rejection
-                                    if !text.trim().is_empty() {
-                                        text_parts.push(text.to_string());
-                                    }
+                                    text_parts.push(text.to_string());
                                 }
                                 // [NEW] 处理图像块 (Codex input_image 格式)
                                 else if part.get("type").and_then(|v| v.as_str())
@@ -569,22 +516,16 @@ pub async fn handle_completions(
 
                         // 构造消息内容：如果有图像则使用数组格式
                         if image_parts.is_empty() {
-                            // [FIX] Only add message if there's actual content
-                            let joined_text = text_parts.join("\n");
-                            if !joined_text.trim().is_empty() {
-                                messages.push(json!({
-                                    "role": role,
-                                    "content": joined_text
-                                }));
-                            }
+                            messages.push(json!({
+                                "role": role,
+                                "content": text_parts.join("\n")
+                            }));
                         } else {
                             let mut content_blocks: Vec<Value> = Vec::new();
-                            // [FIX] Only add text block if joined text is non-empty
-                            let joined_text = text_parts.join("\n");
-                            if !joined_text.trim().is_empty() {
+                            if !text_parts.is_empty() {
                                 content_blocks.push(json!({
                                     "type": "text",
-                                    "text": joined_text
+                                    "text": text_parts.join("\n")
                                 }));
                             }
                             content_blocks.extend(image_parts);
@@ -834,7 +775,8 @@ pub async fn handle_completions(
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
+    // [FIX] Ensure max_attempts is at least 2 to allow for internal retries
+    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size.saturating_add(1)).max(2);
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
@@ -870,7 +812,7 @@ pub async fn handle_completions(
         let force_rotate = attempt > 0;
 
         let (access_token, project_id, email) =
-            match token_manager.get_token(&config.request_type, force_rotate, session_id, &openai_req.model).await {
+            match token_manager.get_token(&config.request_type, force_rotate, session_id, &mapped_model).await {
                 Ok(t) => t,
                 Err(e) => {
                     return (
@@ -888,15 +830,13 @@ pub async fn handle_completions(
         let gemini_body = transform_openai_request(&openai_req, &project_id, &mapped_model);
 
         // [New] 打印转换后的报文 (Gemini Body) 供调试 (Codex 路径) ———— 缩减为 simple debug
-        debug!("[Codex-Request] Transformed Gemini Body ({} parts)",
+        debug!("[Codex-Request] Transformed Gemini Body ({} parts)", 
            gemini_body.get("contents").and_then(|c| c.as_array()).map(|a| a.len()).unwrap_or(0));
 
-        // [DEBUG] 单独打印工具定义 (Codex 路径)
-        if let Some(tools) = gemini_body.get("request").and_then(|r| r.get("tools")) {
-            tracing::info!("[Codex-Tools] Tools sent to Gemini: {}", serde_json::to_string_pretty(tools).unwrap_or_default());
-        }
-
-        let list_response = openai_req.stream;
+        // [AUTO-CONVERSION] For Legacy/Codex as well
+        let client_wants_stream = openai_req.stream;
+        let force_stream_internally = !client_wants_stream;
+        let list_response = client_wants_stream || force_stream_internally;
         let method = if list_response {
             "streamGenerateContent"
         } else {
@@ -927,85 +867,158 @@ pub async fn handle_completions(
                 use futures::StreamExt;
 
                 let gemini_stream = response.bytes_stream();
-                let mut openai_stream = if is_codex_style {
-                    use crate::proxy::mappers::openai::streaming::create_codex_sse_stream;
-                    create_codex_sse_stream(Box::pin(gemini_stream), openai_req.model.clone())
-                } else {
-                    use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream;
-                    create_legacy_sse_stream(Box::pin(gemini_stream), openai_req.model.clone())
-                };
-
-                // [P1 FIX] Enhanced Peek logic to handle heartbeats and slow start
-                let mut first_data_chunk = None;
-                let mut retry_this_account = false;
                 
-                // Loop to skip heartbeats during peek
-                loop {
-                    match tokio::time::timeout(std::time::Duration::from_secs(60), openai_stream.next()).await {
-                        Ok(Some(Ok(bytes))) => {
-                            if bytes.is_empty() {
-                                continue;
+                // DECISION: Which stream to create?
+                // If client wants stream: give them what they asked (Legacy/Codex SSE).
+                // If forced stream: use Chat SSE + Collector, because our collector works on Chat format
+                // and we already have logic to convert Chat JSON -> Legacy JSON.
+                
+                if client_wants_stream {
+                    let mut openai_stream = if is_codex_style {
+                        use crate::proxy::mappers::openai::streaming::create_codex_sse_stream;
+                        create_codex_sse_stream(Box::pin(gemini_stream), openai_req.model.clone())
+                    } else {
+                        use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream;
+                        create_legacy_sse_stream(Box::pin(gemini_stream), openai_req.model.clone())
+                    };
+
+                    // [P1 FIX] Enhanced Peek logic (Reused from above/standard)
+                    let mut first_data_chunk = None;
+                    let mut retry_this_account = false;
+                    
+                    loop {
+                        match tokio::time::timeout(std::time::Duration::from_secs(60), openai_stream.next()).await {
+                            Ok(Some(Ok(bytes))) => {
+                                if bytes.is_empty() { continue; }
+                                let text = String::from_utf8_lossy(&bytes);
+                                if text.trim().starts_with(":") || text.trim().starts_with("data: :") {
+                                    continue;
+                                }
+                                if text.contains("\"error\"") {
+                                    last_error = "Error event during peek".to_string();
+                                    retry_this_account = true;
+                                    break;
+                                }
+                                first_data_chunk = Some(bytes);
+                                break;
                             }
-                            
-                            let text = String::from_utf8_lossy(&bytes);
-                            // Skip SSE comments/pings (heartbeats)
-                            if text.trim().starts_with(":") || text.trim().starts_with("data: :") {
-                                tracing::debug!("[OpenAI-Legacy] Skipping peek heartbeat");
-                                continue;
-                            }
-                            
-                            // Check for error events
-                            if text.contains("\"error\"") {
-                                tracing::warn!("[OpenAI-Legacy] Error detected during peek, retrying...");
-                                last_error = "Error event during peek".to_string();
+                            Ok(Some(Err(e))) => {
+                                last_error = format!("Stream error during peek: {}", e);
                                 retry_this_account = true;
                                 break;
                             }
-                            
-                            // We found real data!
-                            first_data_chunk = Some(bytes);
-                            break;
-                        }
-                        Ok(Some(Err(e))) => {
-                            tracing::warn!("[OpenAI-Legacy] Stream error during peek: {}, retrying...", e);
-                            last_error = format!("Stream error during peek: {}", e);
-                            retry_this_account = true;
-                            break;
-                        }
-                        Ok(None) => {
-                            tracing::warn!("[OpenAI-Legacy] Stream ended during peek (Empty Response), retrying...");
-                            last_error = "Empty response stream during peek".to_string();
-                            retry_this_account = true;
-                            break;
-                        }
-                        Err(_) => {
-                            tracing::warn!("[OpenAI-Legacy] Timeout waiting for first data (60s), retrying...");
-                            last_error = "Timeout waiting for first data".to_string();
-                            retry_this_account = true;
-                            break;
+                            Ok(None) => {
+                                last_error = "Empty response stream".to_string();
+                                retry_this_account = true;
+                                break;
+                            }
+                            Err(_) => {
+                                last_error = "Timeout waiting for first data".to_string();
+                                retry_this_account = true;
+                                break;
+                            }
                         }
                     }
-                }
-                
-                if retry_this_account {
-                    continue; // Rotate to next account
-                }
-                
-                // Combine first chunk with remaining stream
-                let combined_stream = futures::stream::once(async move { 
-                    Ok::<Bytes, String>(first_data_chunk.unwrap()) 
-                })
-                .chain(openai_stream);
+                    
+                    if retry_this_account {
+                        continue; 
+                    }
+                    
+                    let combined_stream = futures::stream::once(async move { 
+                        Ok::<Bytes, String>(first_data_chunk.unwrap()) 
+                    })
+                    .chain(openai_stream);
 
-                return Response::builder()
-                    .header("Content-Type", "text/event-stream")
-                    .header("Cache-Control", "no-cache")
-                    .header("Connection", "keep-alive")
-                    .header("X-Account-Email", &email)
-                    .header("X-Mapped-Model", &mapped_model)
-                    .body(Body::from_stream(combined_stream))
-                    .unwrap()
-                    .into_response();
+                    return Response::builder()
+                        .header("Content-Type", "text/event-stream")
+                        .header("Cache-Control", "no-cache")
+                        .header("Connection", "keep-alive")
+                        .header("X-Account-Email", &email)
+                        .header("X-Mapped-Model", &mapped_model)
+                        .body(Body::from_stream(combined_stream))
+                        .unwrap()
+                        .into_response();
+                } else {
+                    // Forced Stream Internal -> Convert to Legacy JSON
+                    // Use CHAT SSE Stream (so Collector can parse it)
+                    use crate::proxy::mappers::openai::streaming::create_openai_sse_stream;
+                    // Note: We use create_openai_sse_stream regardless of is_codex_style here, 
+                    // because we just want the content aggregation which chat stream does well.
+                    let mut openai_stream = create_openai_sse_stream(Box::pin(gemini_stream), openai_req.model.clone());
+
+                    // Peek Logic (Repeated for safety/correctness on this stream type)
+                    let mut first_data_chunk = None;
+                    let mut retry_this_account = false;
+                    loop {
+                        match tokio::time::timeout(std::time::Duration::from_secs(60), openai_stream.next()).await {
+                            Ok(Some(Ok(bytes))) => {
+                                if bytes.is_empty() { continue; }
+                                let text = String::from_utf8_lossy(&bytes);
+                                if text.trim().starts_with(":") || text.trim().starts_with("data: :") { continue; }
+                                if text.contains("\"error\"") {
+                                    last_error = "Error event in internal stream".to_string();
+                                    retry_this_account = true;
+                                    break; 
+                                }
+                                first_data_chunk = Some(bytes);
+                                break;
+                            }
+                            Ok(Some(Err(e))) => {
+                                last_error = format!("Internal stream error: {}", e);
+                                retry_this_account = true;
+                                break;
+                            }
+                            Ok(None) => {
+                                last_error = "Empty internal stream".to_string();
+                                retry_this_account = true;
+                                break;
+                            }
+                            Err(_) => {
+                                last_error = "Timeout peek internal".to_string();
+                                retry_this_account = true;
+                                break;
+                            }
+                        }
+                    }
+                    if retry_this_account { continue; }
+
+                    let combined_stream = futures::stream::once(async move { 
+                        Ok::<Bytes, String>(first_data_chunk.unwrap()) 
+                    }).chain(openai_stream);
+
+                    // Collect
+                    use crate::proxy::mappers::openai::collector::collect_stream_to_json;
+                    match collect_stream_to_json(Box::pin(combined_stream)).await {
+                         Ok(chat_resp) => {
+                             // NOW: Convert Chat Response -> Legacy Response (Same logic as below)
+                             let choices = chat_resp.choices.iter().map(|c| {
+                                json!({
+                                    "text": match &c.message.content {
+                                        Some(crate::proxy::mappers::openai::OpenAIContent::String(s)) => s.clone(),
+                                        _ => "".to_string()
+                                    },
+                                    "index": c.index,
+                                    "logprobs": null,
+                                    "finish_reason": c.finish_reason
+                                })
+                            }).collect::<Vec<_>>();
+
+                            let legacy_resp = json!({
+                                "id": chat_resp.id,
+                                "object": "text_completion",
+                                "created": chat_resp.created,
+                                "model": chat_resp.model,
+                                "choices": choices,
+                                "usage": chat_resp.usage
+                            });
+
+                            return (StatusCode::OK, [("X-Account-Email", email.as_str()), ("X-Mapped-Model", mapped_model.as_str())], Json(legacy_resp)).into_response();
+                         },
+                         Err(e) => {
+                             return (StatusCode::INTERNAL_SERVER_ERROR, format!("Stream collection error: {}", e)).into_response();
+                         }
+                    }
+                }
             }
 
             let gemini_resp: Value = match response.json().await {
@@ -1063,26 +1076,10 @@ pub async fn handle_completions(
             token_manager.mark_rate_limited_async(&email, status_code, retry_after.as_deref(), &error_text, Some(&mapped_model)).await;
         }
 
-        // [FIX] 处理 400 错误 (Thinking 签名失效)
-        if status_code == 400
-            && (error_text.contains("Invalid `signature`")
-                || error_text.contains("thinking.signature")
-                || error_text.contains("Invalid signature")
-                || error_text.contains("Corrupted thought signature"))
-        {
-            tracing::warn!(
-                "[Codex] Signature error detected on account {}, clearing invalid signature and retrying",
-                email
-            );
-            // 清除失效的全局签名
-            crate::proxy::mappers::openai::streaming::clear_thought_signature();
-            continue; // 重试
-        }
-
         // 确定重试策略
-        let strategy = determine_retry_strategy(status_code, &error_text);
+        let strategy = determine_retry_strategy(status_code, &error_text, false);
         
-        if apply_retry_strategy(strategy, attempt, status_code, &trace_id).await {
+        if apply_retry_strategy(strategy, attempt, max_attempts, status_code, &trace_id).await {
             // 继续重试 (loop 会增加 attempt, 导致 force_rotate=true)
             continue;
         } else {

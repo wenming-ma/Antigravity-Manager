@@ -15,6 +15,7 @@ import Pagination from '../components/common/Pagination';
 import { showToast } from '../components/common/ToastContainer';
 import { Account } from '../types/account';
 import { cn } from '../utils/cn';
+import { isTauri } from '../utils/env';
 
 // ... (省略中间代码)
 
@@ -99,7 +100,11 @@ function Accounts() {
                 showToast(t('accounts.warmup_batch_triggered', { count: successCount }), 'success');
             } else {
                 const msg = await warmUpAccounts();
-                showToast(msg, 'success');
+                if (msg) {
+                    showToast(msg, 'success');
+                } else {
+                    showToast(t('accounts.warmup_all_triggered', '全量预热任务已触发'), 'success');
+                }
             }
         } catch (error) {
             showToast(`${t('common.error')}: ${error}`, 'error');
@@ -110,6 +115,8 @@ function Accounts() {
     };
 
 
+
+    const fileInputRef = useRef<HTMLInputElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
 
@@ -432,9 +439,11 @@ function Accounts() {
                 // 刷新所有
                 setRefreshingIds(new Set(accounts.map(a => a.id)));
                 const stats = await useAccountStore.getState().refreshAllQuotas();
-                successCount = stats.success;
-                failedCount = stats.failed;
-                details.push(...stats.details);
+                if (stats) {
+                    successCount = stats.success;
+                    failedCount = stats.failed;
+                    details.push(...stats.details);
+                }
             }
 
             if (failedCount === 0) {
@@ -468,32 +477,44 @@ function Accounts() {
                 refresh_token: acc.token.refresh_token
             }));
             const content = JSON.stringify(exportData, null, 2);
+            const fileName = `antigravity_accounts_${new Date().toISOString().split('T')[0]}.json`;
 
-            let path: string | null = null;
+            // 2. Determine Path & Export
+            if (isTauri()) {
+                let path: string | null = null;
+                if (config?.default_export_path) {
+                    // Use default path
+                    path = await join(config.default_export_path, fileName);
+                } else {
+                    // Use Native Dialog
+                    path = await save({
+                        filters: [{
+                            name: 'JSON',
+                            extensions: ['json']
+                        }],
+                        defaultPath: fileName
+                    });
+                }
 
-            // 2. Determine Path
-            if (config?.default_export_path) {
-                // Use default path
-                const fileName = `antigravity_accounts_${new Date().toISOString().split('T')[0]}.json`;
-                path = await join(config.default_export_path, fileName);
+                if (!path) return; // Cancelled
+
+                // 3. Write File
+                await invoke('save_text_file', { path, content });
+                showToast(`${t('common.success')} ${path}`, 'success');
             } else {
-                // Use Native Dialog
-                path = await save({
-                    filters: [{
-                        name: 'JSON',
-                        extensions: ['json']
-                    }],
-                    defaultPath: `antigravity_accounts_${new Date().toISOString().split('T')[0]}.json`
-                });
+                // Web 模式：使用浏览器下载
+                const blob = new Blob([content], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = fileName;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                showToast(t('dashboard.toast.export_success', { path: fileName }), 'success');
             }
-
-            if (!path) return; // Cancelled
-
-            // 3. Write File
-            await invoke('save_text_file', { path, content });
-
-            showToast(`${t('common.success')} ${path}`, 'success');
-        } catch (error) {
+        } catch (error: any) {
             console.error('Export failed:', error);
             showToast(`${t('common.error')}: ${error}`, 'error');
         }
@@ -515,65 +536,89 @@ function Accounts() {
         }
     };
 
-    const handleImportJson = async () => {
+    const processImportData = async (content: string) => {
+        let importData: Array<{ email?: string; refresh_token?: string }>;
         try {
-            const selected = await open({
-                multiple: false,
-                filters: [{
-                    name: 'JSON',
-                    extensions: ['json']
-                }]
-            });
-            if (!selected || typeof selected !== 'string') return;
+            importData = JSON.parse(content);
+        } catch {
+            showToast(t('accounts.import_invalid_format'), 'error');
+            return;
+        }
 
-            const content: string = await invoke('read_text_file', { path: selected });
+        if (!Array.isArray(importData) || importData.length === 0) {
+            showToast(t('accounts.import_invalid_format'), 'error');
+            return;
+        }
 
-            let importData: Array<{ email?: string; refresh_token?: string }>;
+        const validEntries = importData.filter(
+            item => item.refresh_token && typeof item.refresh_token === 'string' && item.refresh_token.startsWith('1//')
+        );
+
+        if (validEntries.length === 0) {
+            showToast(t('accounts.import_invalid_format'), 'error');
+            return;
+        }
+
+        let successCount = 0;
+        let failCount = 0;
+
+        for (const entry of validEntries) {
             try {
-                importData = JSON.parse(content);
-            } catch {
-                showToast(t('accounts.import_invalid_format'), 'error');
-                return;
+                await addAccount(entry.email || '', entry.refresh_token!);
+                successCount++;
+            } catch (error) {
+                console.error('Import account failed:', error);
+                failCount++;
             }
+            await new Promise(r => setTimeout(r, 100));
+        }
 
-            if (!Array.isArray(importData) || importData.length === 0) {
-                showToast(t('accounts.import_invalid_format'), 'error');
-                return;
+        if (failCount === 0) {
+            showToast(t('accounts.import_success', { count: successCount }), 'success');
+        } else if (successCount > 0) {
+            showToast(t('accounts.import_partial', { success: successCount, fail: failCount }), 'warning');
+        } else {
+            showToast(t('accounts.import_fail', { error: 'All accounts failed to import' }), 'error');
+        }
+    };
+
+    const handleImportJson = async () => {
+        if (isTauri()) {
+            try {
+                const selected = await open({
+                    multiple: false,
+                    filters: [{
+                        name: 'JSON',
+                        extensions: ['json']
+                    }]
+                });
+                if (!selected || typeof selected !== 'string') return;
+
+                const content: string = await invoke('read_text_file', { path: selected });
+                await processImportData(content);
+            } catch (error) {
+                console.error('Import failed:', error);
+                showToast(t('accounts.import_fail', { error: String(error) }), 'error');
             }
+        } else {
+            // Web 模式: 触发隐藏的 file input
+            fileInputRef.current?.click();
+        }
+    };
 
-            const validEntries = importData.filter(
-                item => item.refresh_token && typeof item.refresh_token === 'string' && item.refresh_token.startsWith('1//')
-            );
+    const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0];
+        if (!file) return;
 
-            if (validEntries.length === 0) {
-                showToast(t('accounts.import_invalid_format'), 'error');
-                return;
-            }
-
-            let successCount = 0;
-            let failCount = 0;
-
-            for (const entry of validEntries) {
-                try {
-                    await addAccount(entry.email || '', entry.refresh_token!);
-                    successCount++;
-                } catch (error) {
-                    console.error('Import account failed:', error);
-                    failCount++;
-                }
-                await new Promise(r => setTimeout(r, 100));
-            }
-
-            if (failCount === 0) {
-                showToast(t('accounts.import_success', { count: successCount }), 'success');
-            } else if (successCount > 0) {
-                showToast(t('accounts.import_partial', { success: successCount, fail: failCount }), 'warning');
-            } else {
-                showToast(t('accounts.import_fail', { error: 'All accounts failed to import' }), 'error');
-            }
+        try {
+            const content = await file.text();
+            await processImportData(content);
         } catch (error) {
             console.error('Import failed:', error);
             showToast(t('accounts.import_fail', { error: String(error) }), 'error');
+        } finally {
+            // 重置 input,允许重复选择同一文件
+            event.target.value = '';
         }
     };
 
@@ -594,6 +639,13 @@ function Accounts() {
     return (
         <div className="h-full flex flex-col p-5 gap-4 max-w-7xl mx-auto w-full">
             {/* 测试按钮 - 在最顶部 */}
+            <input
+                ref={fileInputRef}
+                type="file"
+                accept=".json,application/json"
+                style={{ display: 'none' }}
+                onChange={handleFileChange}
+            />
 
             {/* 顶部工具栏：搜索、过滤和操作按钮 */}
             <div className="flex-none flex items-center gap-2">

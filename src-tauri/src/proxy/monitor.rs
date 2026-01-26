@@ -181,6 +181,20 @@ impl ProxyMonitor {
         }
     }
     
+    pub async fn get_logs_filtered(
+        &self,
+        page: usize,
+        page_size: usize,
+        search_text: Option<String>,
+        level: Option<String>,
+    ) -> Result<Vec<ProxyRequestLog>, String> {
+        let offset = (page.max(1) - 1) * page_size;
+        let errors_only = level.as_deref() == Some("error");
+        let search = search_text.unwrap_or_default();
+
+        crate::modules::proxy_db::get_logs_filtered(&search, errors_only, page_size, offset)
+    }
+    
     pub async fn clear(&self) {
         let mut logs = self.logs.write().await;
         logs.clear();

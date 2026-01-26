@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Cloudflared服务状态管理
+#[derive(Clone)]
 pub struct CloudflaredState {
     pub manager: Arc<RwLock<Option<CloudflaredManager>>>,
 }

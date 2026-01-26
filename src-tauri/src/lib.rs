@@ -8,6 +8,7 @@ pub mod error;
 use tauri::Manager;
 use modules::logger;
 use tracing::{info, warn, error};
+use std::sync::Arc;
 
 /// Increase file descriptor limit for macOS to prevent "Too many open files" errors
 #[cfg(target_os = "macos")]
@@ -43,6 +44,10 @@ fn greet(name: &str) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Check for headless mode
+    let args: Vec<String> = std::env::args().collect();
+    let is_headless = args.iter().any(|arg| arg == "--headless");
+
     // Increase file descriptor limit (macOS only)
     #[cfg(target_os = "macos")]
     increase_nofile_limit();
@@ -55,6 +60,90 @@ pub fn run() {
         error!("Failed to initialize token stats database: {}", e);
     }
     
+    if is_headless {
+        info!("Starting in HEADLESS mode...");
+        
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+        rt.block_on(async {
+            // Initialize states manually
+            let proxy_state = commands::proxy::ProxyServiceState::new();
+            let cf_state = Arc::new(commands::cloudflared::CloudflaredState::new());
+
+            // Load config
+            match modules::config::load_app_config() {
+                Ok(mut config) => {
+                    // Force LAN access in headless/docker mode so it binds to 0.0.0.0
+                    config.proxy.allow_lan_access = true;
+
+                    // [NEW] 支持通过环境变量注入 API Key
+                    // 优先级：ABV_API_KEY > API_KEY > 配置文件
+                    let env_key = std::env::var("ABV_API_KEY")
+                        .or_else(|_| std::env::var("API_KEY"))
+                        .ok();
+
+                    if let Some(key) = env_key {
+                        if !key.trim().is_empty() {
+                            info!("Using API Key from environment variable");
+                            config.proxy.api_key = key;
+                        }
+                    }
+
+                    // [NEW] 支持通过环境变量注入 Web UI 密码
+                    // 优先级：ABV_WEB_PASSWORD > WEB_PASSWORD > 配置文件
+                    let env_web_password = std::env::var("ABV_WEB_PASSWORD")
+                        .or_else(|_| std::env::var("WEB_PASSWORD"))
+                        .ok();
+                    
+                    if let Some(pwd) = env_web_password {
+                        if !pwd.trim().is_empty() {
+                            info!("Using Web UI Password from environment variable");
+                            config.proxy.admin_password = Some(pwd);
+                        }
+                    }
+
+                    info!("--------------------------------------------------");
+                    info!("🚀 Headless mode proxy service starting...");
+                    info!("📍 Port: {}", config.proxy.port);
+                    info!("🔑 Current API Key: {}", config.proxy.api_key);
+                    if let Some(ref pwd) = config.proxy.admin_password {
+                        info!("🔐 Web UI Password: {}", pwd);
+                    } else {
+                        info!("🔐 Web UI Password: (Same as API Key)");
+                    }
+                    info!("💡 Tips: You can use these keys to login to Web UI and access AI APIs.");
+                    info!("💡 Search docker logs or grep gui_config.json to find them.");
+                    info!("--------------------------------------------------");
+                    
+                    // Start proxy service
+                    if let Err(e) = commands::proxy::internal_start_proxy_service(
+                        config.proxy,
+                        &proxy_state,
+                        crate::modules::integration::SystemManager::Headless,
+                        cf_state.clone(),
+                    ).await {
+                        error!("Failed to start proxy service in headless mode: {}", e);
+                        std::process::exit(1);
+                    }
+                    
+                    info!("Headless proxy service is running.");
+                    
+                    // Start smart scheduler
+                    modules::scheduler::start_scheduler(None, proxy_state.clone());
+                    info!("Smart scheduler started in headless mode.");
+                }
+                Err(e) => {
+                    error!("Failed to load config for headless mode: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            
+            // Wait for Ctrl-C
+            tokio::signal::ctrl_c().await.ok();
+            info!("Headless mode shutting down");
+        });
+        return;
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -104,18 +193,34 @@ pub fn run() {
             modules::tray::create_tray(app.handle())?;
             info!("Tray created");
             
-            // Auto-start proxy service
+            // 立即启动管理服务器 (8045)，以便 Web 端能访问
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 // Load config
                 if let Ok(config) = modules::config::load_app_config() {
+                    let state = handle.state::<commands::proxy::ProxyServiceState>();
+                    let cf_state = handle.state::<commands::cloudflared::CloudflaredState>();
+                    let integration = crate::modules::integration::SystemManager::Desktop(handle.clone());
+                    
+                    // 1. 确保管理后台开启
+                    if let Err(e) = commands::proxy::ensure_admin_server(
+                        config.proxy.clone(),
+                        &state,
+                        integration.clone(),
+                        Arc::new(cf_state.inner().clone()),
+                    ).await {
+                        error!("Failed to start admin server: {}", e);
+                    } else {
+                        info!("Admin server (port {}) started successfully", config.proxy.port);
+                    }
+
+                    // 2. 自动启动转发逻辑
                     if config.proxy.auto_start {
-                        let state = handle.state::<commands::proxy::ProxyServiceState>();
-                        // Attempt to start service
-                        if let Err(e) = commands::proxy::start_proxy_service(
+                        if let Err(e) = commands::proxy::internal_start_proxy_service(
                             config.proxy,
-                            state,
-                            handle.clone(),
+                            &state,
+                            integration,
+                            Arc::new(cf_state.inner().clone()),
                         ).await {
                             error!("Failed to auto-start proxy service: {}", e);
                         } else {
@@ -126,24 +231,11 @@ pub fn run() {
             });
             
             // Start smart scheduler
-            modules::scheduler::start_scheduler(app.handle().clone());
+            let scheduler_state = app.handle().state::<commands::proxy::ProxyServiceState>();
+            modules::scheduler::start_scheduler(Some(app.handle().clone()), scheduler_state.inner().clone());
             
-            // Start HTTP API server (for external calls, e.g. VS Code plugin)
-            match modules::http_api::load_settings() {
-                Ok(settings) if settings.enabled => {
-                    modules::http_api::spawn_server(settings.port);
-                    info!("HTTP API server started on port {}", settings.port);
-                }
-                Ok(_) => {
-                    info!("HTTP API server is disabled in settings");
-                }
-                Err(e) => {
-                    // Use default port if loading fails
-                    error!("Failed to load HTTP API settings: {}, using default port", e);
-                    modules::http_api::spawn_server(modules::http_api::DEFAULT_PORT);
-                    info!("HTTP API server started on port {}", modules::http_api::DEFAULT_PORT);
-                }
-            }
+            // [PHASE 1] 已整合至 Axum 端口 (8045)，不再单独启动 19527 端口
+            info!("Management API integrated into main proxy server (port 8045)");
             
             Ok(())
         })

@@ -6,6 +6,8 @@ use tracing::{debug, error, info};
 use crate::proxy::mappers::gemini::{wrap_request, unwrap_response};
 use crate::proxy::server::AppState;
 use crate::proxy::session_manager::SessionManager;
+use crate::proxy::handlers::common::{determine_retry_strategy, apply_retry_strategy, should_rotate_account, RetryStrategy};
+use tokio::time::Duration;
  
 const MAX_RETRY_ATTEMPTS: usize = 3;
  
@@ -29,7 +31,14 @@ pub async fn handle_generate(
     if method != "generateContent" && method != "streamGenerateContent" {
         return Err((StatusCode::BAD_REQUEST, format!("Unsupported method: {}", method)));
     }
-    let is_stream = method == "streamGenerateContent";
+    let client_wants_stream = method == "streamGenerateContent";
+    // [AUTO-CONVERSION] 强制内部流式化
+    let force_stream_internally = !client_wants_stream;
+    let is_stream = client_wants_stream || force_stream_internally;
+
+    if force_stream_internally {
+        // debug!("[AutoConverter] Converting non-stream request to stream");
+    }
 
     // 2. 获取 UpstreamClient 和 TokenManager
     let upstream = state.upstream.clone();
@@ -148,6 +157,7 @@ pub async fn handle_generate(
                     continue;
                 }
 
+                let s_id_for_stream = s_id.clone();
                 let stream = async_stream::stream! {
                     let mut first_data = first_chunk;
                     loop {
@@ -197,8 +207,9 @@ pub async fn handle_generate(
                                                         if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                                                             for part in parts {
                                                                 if let Some(sig) = part.get("thoughtSignature").and_then(|s| s.as_str()) {
-                                                                    crate::proxy::SignatureCache::global().cache_session_signature(&s_id, sig.to_string());
-                                                                    debug!("[Gemini-SSE] Cached signature (len: {}) for session: {}", sig.len(), s_id);
+                                                                    crate::proxy::SignatureCache::global()
+                                                                        .cache_session_signature(&s_id_for_stream, sig.to_string(), 1);
+                                                                    debug!("[Gemini-SSE] Cached signature (len: {}) for session: {}", sig.len(), s_id_for_stream);
                                                                 }
                                                             }
                                                         }
@@ -232,17 +243,33 @@ pub async fn handle_generate(
                     }
                 };
                 
-                let body = Body::from_stream(stream);
-                return Ok(Response::builder()
-                    .header("Content-Type", "text/event-stream")
-                    .header("Cache-Control", "no-cache")
-                    .header("Connection", "keep-alive")
-                    .header("X-Accel-Buffering", "no")
-                    .header("X-Account-Email", &email)
-                    .header("X-Mapped-Model", &mapped_model)
-                    .body(body)
-                    .unwrap()
-                    .into_response());
+                if client_wants_stream {
+                    let body = Body::from_stream(stream);
+                    return Ok(Response::builder()
+                        .header("Content-Type", "text/event-stream")
+                        .header("Cache-Control", "no-cache")
+                        .header("Connection", "keep-alive")
+                        .header("X-Accel-Buffering", "no")
+                        .header("X-Account-Email", &email)
+                        .header("X-Mapped-Model", &mapped_model)
+                        .body(body)
+                        .unwrap()
+                        .into_response());
+                } else {
+                    // Collect to JSON
+                    use crate::proxy::mappers::gemini::collector::collect_stream_to_json;
+                    match collect_stream_to_json(Box::pin(stream), &s_id).await {
+                         Ok(gemini_resp) => {
+                             info!("[{}] ✓ Stream collected and converted to JSON (Gemini)", session_id);
+                             let unwrapped = unwrap_response(&gemini_resp);
+                             return Ok((StatusCode::OK, [("X-Account-Email", email.as_str()), ("X-Mapped-Model", mapped_model.as_str())], Json(unwrapped)).into_response());
+                         },
+                         Err(e) => {
+                             error!("Stream collection error: {}", e);
+                             return Ok((StatusCode::INTERNAL_SERVER_ERROR, format!("Stream collection error: {}", e)).into_response());
+                         }
+                    }
+                }
             }
 
             let gemini_resp: Value = response
@@ -263,7 +290,8 @@ pub async fn handle_generate(
                         if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                             for part in parts {
                                 if let Some(sig) = part.get("thoughtSignature").and_then(|s| s.as_str()) {
-                                    crate::proxy::SignatureCache::global().cache_session_signature(&session_id, sig.to_string());
+                                    crate::proxy::SignatureCache::global()
+                                        .cache_session_signature(&session_id, sig.to_string(), 1);
                                     debug!("[Gemini-Response] Cached signature (len: {}) for session: {}", sig.len(), session_id);
                                 }
                             }
@@ -282,18 +310,16 @@ pub async fn handle_generate(
         let error_text = response.text().await.unwrap_or_else(|_| format!("HTTP {}", status_code));
         last_error = format!("HTTP {}: {}", status_code, error_text);
  
-        // 只有 429 (限流), 529 (过载), 503, 403 (权限) 和 401 (认证失效) 触发账号轮换
-        if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 || status_code == 403 || status_code == 401 {
-            // 记录限流信息 (全局同步)
-            token_manager.mark_rate_limited(&email, status_code, retry_after.as_deref(), &error_text);
+        // 确定重试策略
+        let strategy = determine_retry_strategy(status_code, &error_text, false);
+        let trace_id = format!("gemini_{}", session_id);
 
-            // 只有明确包含 "QUOTA_EXHAUSTED" 才停止，避免误判上游的频率限制提示 (如 "check quota")
-            if status_code == 429 && error_text.contains("QUOTA_EXHAUSTED") {
-                error!("Gemini Quota exhausted (429) on account {} attempt {}/{}, stopping to protect pool.", email, attempt + 1, max_attempts);
-                return Ok((status, [("X-Account-Email", email.as_str())], error_text).into_response());
+        // 执行退避
+        if apply_retry_strategy(strategy, attempt, max_attempts, status_code, &trace_id).await {
+            // 判断是否需要轮换账号
+            if !should_rotate_account(status_code) {
+                debug!("[{}] Keeping same account for status {} (Gemini server-side issue)", trace_id, status_code);
             }
-
-            tracing::warn!("Gemini Upstream {} on account {} attempt {}/{}, rotating account", status_code, email, attempt + 1, max_attempts);
             continue;
         }
 

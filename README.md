@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> 专业的 AI 账号管理与协议反代系统 (v3.3.50)
+> 专业的 AI 账号管理与协议反代系统 (v4.0.2)
 <div align="center">
   <img src="public/icon.png" alt="Antigravity Logo" width="120" height="120" style="border-radius: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.15);">
 
@@ -8,7 +8,7 @@
   
   <p>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-3.3.50-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.0.2-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -112,6 +112,8 @@ graph TD
 ##  安装指南 (Installation)
 
 ### 选项 A: 终端安装 (macOS & Linux 推荐)
+
+#### macOS 
 如果您已安装 [Homebrew](https://brew.sh/)，可以通过以下命令快速安装：
 
 ```bash
@@ -121,9 +123,24 @@ brew tap lbjlaq/antigravity-manager https://github.com/lbjlaq/Antigravity-Manage
 # 2. 安装应用
 brew install --cask antigravity-tools
 ```
-> **提示**: 
-> - **macOS**: 如果遇到权限问题，建议添加 `--no-quarantine` 参数。
-> - **Linux**: 安装后会自动将 AppImage 添加到二进制路径并配置可执行权限。
+> **提示**: 如果遇到权限问题，建议添加 `--no-quarantine` 参数。
+
+#### Arch Linux
+您可以选择通过一键安装脚本或 Homebrew 进行安装：
+
+**方式 1：一键安装脚本 (推荐)**
+```bash
+curl -sSL https://raw.githubusercontent.com/lbjlaq/Antigravity-Manager/main/deploy/arch/install.sh | bash
+```
+
+**方式 2：通过 Homebrew** (如果您已安装 [Linuxbrew](https://sh.brew.sh/))
+```bash
+brew tap lbjlaq/antigravity-manager https://github.com/lbjlaq/Antigravity-Manager
+brew install --cask antigravity-tools
+```
+
+#### 其他 Linux 发行版
+安装后会自动将 AppImage 添加到二进制路径并配置可执行权限。
 
 ### 选项 B: 手动下载
 前往 [GitHub Releases](https://github.com/lbjlaq/Antigravity-Manager/releases) 下载对应系统的包：
@@ -131,38 +148,55 @@ brew install --cask antigravity-tools
 *   **Windows**: `.msi` 或 便携版 `.zip`
 *   **Linux**: `.deb` 或 `AppImage`
 
-### 选项 C: Arch Linux (官方脚本)
-我们为 Arch Linux 用户提供了一个官方的一键安装脚本，它会自动从 GitHub 获取最新版本并完成安装：
-```bash
-curl -sSL https://raw.githubusercontent.com/lbjlaq/Antigravity-Manager/main/deploy/arch/install.sh | bash
-```
-> **提示**: 该脚本会自动下载最新的 `.deb` 资产并使用 `makepkg` 进行安装。
-
-### 选项 C: 远程服务器部署 (Headless Linux)
-如果您需要在无界面的远程 Linux 服务器（如 Ubuntu/Debian/CentOS）上运行，可以使用我们提供的 **Headless (Xvfb)** 一键部署方案：
+### 选项 C: Docker 部署 (推荐用于 NAS/服务器)
+如果您希望在容器化环境中运行，我们提供了原生的 Docker 镜像。该镜像内置了对 v4.0.2 原生 Headless 架构的支持，可自动托管前端静态资源，并通过浏览器直接进行管理。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lbjlaq/Antigravity-Manager/main/deploy/headless-xvfb/install.sh | sudo bash
-```
-> **注意**: 该方案通过 Xvfb 模拟图形环境，资源占用（内存/CPU）会高于纯后端应用。
-> **详情见**: [服务器部署指南 (deploy/headless-xvfb)](./deploy/headless-xvfb/README.md)
+# 方式 1: 直接运行 (推荐)
+# - API_KEY: 必填。用于所有协议的 AI 请求鉴定。
+# - WEB_PASSWORD: 可选。用于管理后台登录。若不设置则默认使用 API_KEY。
+docker run -d --name antigravity-manager \
+  -p 8045:8045 \
+  -e API_KEY=sk-your-api-key \
+  -e WEB_PASSWORD=your-login-password \
+  -v ~/.antigravity_tools:/root/.antigravity_tools \
+  lbjlaq/antigravity-manager:latest
 
-### 选项 D: Docker 部署 (推荐用于 NAS/服务器)
-如果您希望在容器化环境中运行，我们提供了完整的 Docker 镜像和配置，内置 noVNC 支持，可通过浏览器直接访问图形界面。
+# 忘记密钥？执行 docker logs antigravity-manager 或 grep -E '"api_key"|"admin_password"' ~/.antigravity_tools/gui_config.json
 
-```bash
-# 1. 进入部署目录
-cd deploy/docker
+#### 🔐 鉴权逻辑说明
+*   **场景 A：仅设置了 `API_KEY`**
+    - **Web 登录**：使用 `API_KEY` 进入后台。
+    - **API 调用**：使用 `API_KEY` 进行 AI 请求鉴权。
+*   **场景 B：同时设置了 `API_KEY` 和 `WEB_PASSWORD` (推荐)**
+    - **Web 登录**：**必须**使用 `WEB_PASSWORD`，使用 API Key 将被拒绝（更安全）。
+    - **API 调用**：统一使用 `API_KEY`。这样您可以将 API Key 分发给成员，而保留密码仅供管理员使用。
 
+#### 🆙 旧版本升级指引
+如果您是从 v4.0.1 及更早版本升级，系统默认未设置 `WEB_PASSWORD`。您可以通过以下任一方式设置：
+1.  **Web UI 界面 (推荐)**：使用原有 `API_KEY` 登录后，在 **API 反代设置** 页面手动设置并保存。新密码将持久化存储在 `gui_config.json` 中。
+2.  **环境变量 (Docker)**：在启动容器时增加 `-e WEB_PASSWORD=您的新密码`。**注意：环境变量具有最高优先级，将覆盖 UI 中的任何修改。**
+3.  **配置文件 (持久化)**：直接修改 `~/.antigravity_tools/gui_config.json`，在 `proxy` 对象中修改或添加 `"admin_password": "您的新密码"` 字段。
+    - *注：`WEB_PASSWORD` 是环境变量名，`admin_password` 是配置文件中的 JSON 键名。*
+
+> [!TIP]
+> **密码优先级逻辑 (Priority)**:
+> - **第一优先级 (环境变量)**: `ABV_WEB_PASSWORD` 或 `WEB_PASSWORD`。只要设置了环境变量，系统将始终使用它。
+> - **第二优先级 (配置文件)**: `gui_config.json` 中的 `admin_password` 字段。UI 的“保存”操作会更新此值。
+> - **保底回退 (向后兼容)**: 若上述均未设置，则回退使用 `API_KEY` 作为登录密码。
+
+# 方式 2: 使用 Docker Compose
+# 1. 进入项目的 docker 目录
+cd docker
 # 2. 启动服务
 docker compose up -d
 ```
-> **访问地址**: `http://localhost:6080/vnc_lite.html` (默认 VNC 密码: `password`)
+> **访问地址**: `http://localhost:8045` (管理后台) | `http://localhost:8045/v1` (API Base)
 > **系统要求**:
-> - **内存**: 建议 **2GB** (最小 512MB)。
-> - **共享内存**: 需设置 `shm_size: 2gb` (已在 compose 中配置)，防止浏览器崩溃。
+> - **内存**: 建议 **1GB** (最小 256MB)。
+> - **持久化**: 需挂载 `/root/.antigravity_tools` 以保存数据。
 > - **架构**: 支持 x86_64 和 ARM64。
-> **详情见**: [Docker 部署指南 (deploy/docker)](./deploy/docker/README.md)
+> **详情见**: [Docker 部署指南 (docker)](./docker/README.md)
 
 ---
 
@@ -324,7 +358,108 @@ response = client.chat.completions.create(
 ## 📝 开发者与社区
 
 *   **版本演进 (Changelog)**:
-    *   **v3.3.50 (2026-01-23)**:
+    *   **v4.0.2 (2026-01-26)**:
+        -   **[核心修复] 解决开启“访问授权”导致的重复认证与 401 循环 (Fix Issue #1163)**:
+            - 修正了后端鉴权中间件逻辑，确保在鉴权关闭模式（Off/Auto）下管理接口不再强制拦截。
+            - 增强了健康检查路径 (`/api/health`) 的免鉴权豁免，避免 UI 加载初期因状态检测失败触发登录。
+            - 在前端请求层引入了 401 异常频率限制（防抖锁），彻底解决了大批量请求失败导致的 UI 弹窗抖动。
+        -   **[核心修复] 解决切换账号后会话无法持久化保存 (Fix Issue #1159)**:
+            - 增强了数据库注入逻辑，在切换账号时同步更新身份标识（Email）并清除旧的 UserID 缓存。
+            - 解决了因 Token 与身份标识不匹配导致客户端无法正确关联或保存新会话的问题。
+        -   **[核心修复] Docker/Web 模式下模型映射持久化 (Fix Issue #1149)**:
+            - 修复了在 Docker 或 Web 部署模式下，管理员通过 API 修改的模型映射配置（Model Mapping）无法保存到硬盘的问题。
+            - 确保 `admin_update_model_mapping` 接口正确调用持久化逻辑，配置在重启容器后依然生效。
+        -   **[架构优化] MCP 工具支持架构全面升级 (Schema Cleaning & Tool Adapters)**:
+            - **约束语义回填 (Constraint Hints)**:
+                - 实现了智能约束迁移机制，在删除 Gemini 不支持的约束字段(`minLength`, `pattern`, `format` 等)前，自动将其转化为描述提示。
+                - 新增 `CONSTRAINT_FIELDS` 常量和 `move_constraints_to_description` 函数，确保模型能通过描述理解原始约束。
+                - 示例: `{"minLength": 5}` → `{"description": "[Constraint: minLen: 5]"}`
+            - **anyOf/oneOf 智能扁平化增强**:
+                - 重写 `extract_best_schema_from_union` 函数，使用评分机制选择最佳类型(object > array > scalar)。
+                - 在合并后自动添加 `"Accepts: type1 | type2"` 提示到描述中，保留所有可能类型的信息。
+                - 新增 `get_schema_type_name` 函数，支持显式类型和结构推断。
+            - **插件化工具适配器层 (Tool Adapter System)**:
+                - 创建 `ToolAdapter` trait，为不同 MCP 工具提供定制化 Schema 处理能力。
+                - 实现 `PencilAdapter`，自动为 Pencil 绘图工具的视觉属性(`cornerRadius`, `strokeWidth`)和路径参数添加说明。
+                - 建立全局适配器注册表，支持通过 `clean_json_schema_for_tool` 函数应用工具特定优化。
+            - **高性能缓存层 (Schema Cache)**:
+                - 实现基于 SHA-256 哈希的 Schema 缓存机制，避免重复清洗相同的 Schema。
+                - 采用 LRU 淘汰策略，最大缓存 1000 条，内存占用 < 10MB。
+                - 提供 `clean_json_schema_cached` 函数和缓存统计功能，预计性能提升 60%+。
+            - **影响范围**: 
+                - ✅ 显著提升 MCP 工具(如 Pencil)的 Schema 兼容性和模型理解能力
+                - ✅ 为未来添加更多 MCP 工具(filesystem, database 等)奠定了插件化基础
+                - ✅ 完全向后兼容，所有 25 项测试通过
+        -   **[安全增强] Web UI 管理后台密码与 API Key 分离 (Fix Issue #1139)**:
+            - **独立密码配置**: 支持通过 `ABV_WEB_PASSWORD` 或 `WEB_PASSWORD` 环境变量设置独立的管理后台登录密码。
+            - **智能鉴权逻辑**: 
+                - 管理接口优先验证独立密码，未设置时自动回退验证 `API_KEY`（确保向后兼容）。
+                - AI 代理接口严格仅允许使用 `API_KEY` 进行认证，实现权限隔离。
+            - **配置 UI 支持**: 在“仪表盘-服务配置”中新增管理密码编辑项，支持一键找回或修改。
+            - **日志引导**: Headless 模式启动时会清晰打印 API Key 与 Web UI Password 的状态及查看方式。
+    *   **v4.0.1 (2026-01-26)**:
+        -   **[UX 优化] 主题与语言切换平滑度**:
+            - 解决了主题和语言切换时的 UI 卡顿问题，将配置持久化逻辑与状态更新解耦。
+            - 优化了导航栏中的 View Transition API 使用，确保视觉更新不阻塞操作。
+            - 将窗口背景同步调用改为异步，避免 React 渲染延迟。
+        -   **[核心修复] 反代服务启动死锁**:
+            - 修复了启动反代服务时会阻塞状态轮询请求的竞态/死锁问题。
+            - 引入了原子启动标志和非阻塞状态检查，确保 UI 在服务初始化期间保持响应。
+    *   **v4.0.0 (2026-01-25)**:
+        -   **[重大架构] 深度迁移至 Tauri v2 (Tauri v2 Migration)**:
+            - 全面适配 Tauri v2 核心 API，包括系统托盘、窗口管理与事件系统。
+            - 解决了多个异步 Trait 动态派发与生命周期冲突问题，后端性能与稳定性显著提升。
+        -   **[部署革新] 原生 Headless Docker 模式 (Native Headless Docker)**:
+            - 实现了“纯后端”Docker 镜像，彻底移除了对 VNC、noVNC 或 XVFB 的依赖，大幅降低内存与 CPU 占用。
+            - 支持直接托管前端静态资源，容器启动后即可通过浏览器远程管理。
+        -   **[部署修复] Arch Linux 安装脚本修复 (PR #1108)**:
+            - 修复了 `deploy/arch/PKGBUILD.template` 中硬编码 `data.tar.zst` 导致的提取失败问题。
+            - 实现了基于通配符的动态压缩格式识别，确保兼容不同版本的 `.deb` 包。
+        -   **[管理升级] 全功能 Web 管理界面 (Web-based Console)**:
+            - 重写了管理后台，使所有核心功能（账号管理、API 反代监控、OAuth 授权、模型映射）均可在浏览器端完成。
+            - 补全了 Web 模式下的 OAuth 回调处理，支持 `ABV_PUBLIC_URL` 自定义，完美适配远程 VPS 或 NAS 部署场景。
+        -   **[项目规范化] 结构清理与单元化 (Project Normalization)**:
+            - 清理了冗余的 `deploy` 目录及其旧版脚本，项目结构更加现代。
+            - 规范化 Docker 镜像名称为 `antigravity-manager`，并整合专属的 `docker/` 目录与部署手册。
+        -   **[API 增强] 流量日志与监控优化**:
+            - 优化了流量日志的实时监控体验，补全了 Web 模式下的轮询机制与统计接口。
+            - 精确化管理 API 路由占位符命名，提升了 API 的调用精确度。
+        -   **[用户体验] 监控页面布局与深色模式优化 (PR #1105)**:
+            -   **布局重构**: 优化了流量日志页面的容器布局，采用固定最大宽度与响应式边距，解决了在大屏显示器下的内容过度拉伸问题，视觉体验更加舒适。
+            -   **深色模式一致性**: 将日志详情弹窗的配色方案从硬编码的 Slate 色系迁移至 Base 主题色系，确保与全局深色模式风格无缝统一，提升了视觉一致性。
+        -   **[用户体验] 自动更新体验优化**:
+            -   **智能降级**: 修复了当原生更新包未就绪（如 Draft Release）时点击更新无反应的问题。现在系统会自动检测并提示用户，同时优雅降级至浏览器下载模式，确保持续可更新。
+        -   **[核心修复] 深度优化 Signature Cache 与 Rewind 检测 (PR #1094)**:
+            -   **400 错误自愈**: 增强了思考块签名的清洗逻辑。系统现在能自动识别因服务器重启导致的“无主签名”，并在发送给上游前主动将其剥离，从根本上杜绝了由此引发了 `400 Invalid signature` 报错。
+            -   **Rewind (回退) 检测机制**: 升级缓存层，引入消息计数（Message Count）校验。当用户回退对话历史并重新发送时，系统会自动重置签名状态，确保对话流的合法性。
+            -   **全链路适配**: 优化了 Claude、Gemini 及 z.ai (Anthropic) 的数据链路，确保消息计数在流式与非流式请求中均能精准传播。
+        -   **[OpenAI 鲁棒性增强] 优化重试策略与模型级限流 (PR #1093)**:
+            -   **鲁棒重试**: 强制最小 2 次请求尝试，确保单账号模式下也能有效应对瞬时网络抖动；移除了配额耗尽的硬中断，允许自动轮换账号。
+            -   **模型级限流**: 引入模型级限流隔离，避免单个模型限流锁定整个账号，确保账号下其他模型可用。
+            -   **接口修复**: 修复了 TokenManager 异步接口的 Email/ID 混用漏洞，确保限流记录准确。
+        -   **[系统鲁棒性] 统一重试与退避调度中心 (Unified Retry & Backoff Hub)**:
+            -   **逻辑归一化**: 将散落在各协议处理器中的重试逻辑抽象至 `common.rs`，实现全局统一调度。
+            -   **强制退避延迟**: 彻底修复了原先逻辑中解析不到 `Retry-After` 就立即重试导致封号的问题。现在所有处理器在重试前必须通过共享模块执行物理等待，有效保护 IP 信誉。
+            -   **激进参数调整**: 针对 Google/Anthropic 频率限制，将 429 和 503 的初始退避时间显著上调至 **5s-10s**，大幅降低生产环境风控风险。
+        -   **[CLI 同步优化] 解决 Token 冲突与模型配置清理 (PR #1054)**:
+            -   **自动冲突解决**: 在设置 `ANTHROPIC_API_KEY` 时自动移除冲突的 `ANTHROPIC_AUTH_TOKEN`，解决 Claude CLI 同步报错问题。
+            -   **环境变量清理**: 同步时自动移除 `ANTHROPIC_MODEL` 等可能干扰模型输出的环境变量，确保 CLI 使用标准模型。
+            -   **配置健壮性**: 优化了 API Key 为空时的处理方式，避免无效配置干扰。
+        -   **[核心优化] 用量缩放功能默认关闭与联动机制 (Usage Scaling Default Off)**:
+            -   **默认关闭**: 基于用户反馈，将"启用用量缩放"功能从默认开启改为默认关闭，回归透明模式。
+            -   **联动机制**: 建立了缩放与自动压缩 (L1/L2/L3) 的联动关系。只有当用户主动开启缩放时，才同步激活自动压缩逻辑。
+            -   **解决痛点**: 修复了用户反馈的"缩放致盲"问题 - 默认模式下客户端能看到真实 Token 用量，在接近 200k 时触发原生 `/compact` 提示，避免死锁。
+            -   **功能定位**: 将缩放+压缩重新定义为"激进扩容模式"，仅供处理超大型项目时手动开启，提升系统稳定性与可预测性。
+            -   **⚠️ 升级提醒**: 从旧版本升级的用户,建议在"设置 → 实验性功能"中手动关闭"启用用量缩放",以获得更稳定透明的体验。
+        -   **[协议优化] 全协议自动流式转换 (Auto-Stream Conversion)**:
+            -   **全链路覆盖**: 对 OpenAI (Chat/Legacy/Codex) 和 Gemini 协议实现了强制内部流式化转换。即使客户端请求非流式 (`stream: false`)，后端也会自动建立流式连接与上游通信，极大提升了连接稳定性和配额利用率。
+            -   **智能聚合**: 实现了高性能的流式聚合器，在兼容旧版客户端的同时，还能在后台实时捕获 Thinking 签名，有效解决了非流式请求下签名丢失导致后续工具调用失败的问题。
+        -   **[核心修复] 错误日志元数据补全 (Log Metadata Fix)**:
+            -   **问题背景**: 之前版本在 429/503 等严重错误（如账号耗尽）发生时，日志记录中遗漏了 `mapped_model` 和 `account_email` 字段，导致无法定位出错的具体模型和账号。
+            -   **修复内容**: 在 OpenAI 和 Claude 协议的所有错误退出路径（包括 Token 获取失败、转换异常、重试耗尽）中强制注入了元数据 Header。现在即使请求失败，流量日志也能准确显示目标模型和上下文信息，极大提升了排查效率。
+
+
+    *   **v4.0.0 (2026-01-25)**:
         -   **[核心功能] 后台任务模型可配置 (Background Model Configuration)**:
             -   **功能增强**: 允许用户自定义“后台任务”（如标题生成、摘要压缩）使用的模型。不再强制绑定 `gemini-2.5-flash`。
             -   **UI 更新**: 在“模型映射”页面新增了“后台任务模型”配置项，支持从下拉菜单中选择任意可用模型（如 `gemini-3-flash`）。

@@ -11,6 +11,7 @@ import SmartWarmup from '../components/settings/SmartWarmup';
 import PinnedQuotaModels from '../components/settings/PinnedQuotaModels';
 
 import { useTranslation } from 'react-i18next';
+import { isTauri } from '../utils/env';
 
 
 function Settings() {
@@ -65,13 +66,6 @@ function Settings() {
         downloadUrl: string;
     } | null>(null);
 
-    // HTTP API settings state
-    const [httpApiSettings, setHttpApiSettings] = useState<{
-        enabled: boolean;
-        port: number;
-    }>({ enabled: true, port: 19527 });
-    const [httpApiPortInput, setHttpApiPortInput] = useState('19527');
-    const [httpApiSettingsChanged, setHttpApiSettingsChanged] = useState(false);
 
     useEffect(() => {
         loadConfig();
@@ -99,13 +93,6 @@ function Settings() {
             })
             .catch(err => console.error('Failed to get auto launch status:', err));
 
-        // 加载 HTTP API 设置
-        invoke<{ enabled: boolean; port: number }>('get_http_api_settings')
-            .then(settings => {
-                setHttpApiSettings(settings);
-                setHttpApiPortInput(String(settings.port));
-            })
-            .catch(err => console.error('Failed to load HTTP API settings:', err));
     }, [loadConfig]);
 
     useEffect(() => {
@@ -189,7 +176,8 @@ function Settings() {
 
     const handleDetectAntigravityPath = async () => {
         try {
-            const path = await invoke<string>('get_antigravity_path', { bypassConfig: true });
+            const command = isTauri() ? 'get_antigravity_path' : 'get_antigravity_path'; // 后端已统一
+            const path = await invoke<string>(command, { bypassConfig: true });
             setFormData({ ...formData, antigravity_executable: path });
             showToast(t('settings.advanced.antigravity_path_detected'), 'success');
         } catch (error) {
@@ -342,7 +330,14 @@ function Settings() {
 
                             {/* 开机自动启动 */}
                             <div>
-                                <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-2">{t('settings.general.auto_launch')}</label>
+                                <div className="flex justify-between items-center mb-2">
+                                    <label className="block text-sm font-medium text-gray-900 dark:text-base-content">{t('settings.general.auto_launch')}</label>
+                                    {!isTauri() && (
+                                        <span className="text-xs text-orange-500 dark:text-orange-400">
+                                            {t('settings.web_mode_limitation', '(Web 模式不支持)')}
+                                        </span>
+                                    )}
+                                </div>
                                 <select
                                     className="w-full px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900 dark:text-base-content bg-gray-50 dark:bg-base-200"
                                     value={formData.auto_launch ? 'enabled' : 'disabled'}
@@ -358,72 +353,75 @@ function Settings() {
                                     }}
                                 >
                                     <option value="disabled">{t('settings.general.auto_launch_disabled')}</option>
-                                    <option value="enabled">{t('settings.general.auto_launch_enabled')}</option>
+                                    <option value="enabled" disabled={!isTauri()}>{t('settings.general.auto_launch_enabled')}</option>
+
                                 </select>
                                 <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.general.auto_launch_desc')}</p>
                             </div>
 
                             {/* 自动检查更新 */}
-                            <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-base-200 rounded-lg border border-gray-100 dark:border-base-300">
-                                <div>
-                                    <div className="font-medium text-gray-900 dark:text-base-content">{t('settings.general.auto_check_update')}</div>
-                                    <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{t('settings.general.auto_check_update_desc')}</p>
+                            <>
+                                <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-base-200 rounded-lg border border-gray-100 dark:border-base-300">
+                                    <div>
+                                        <div className="font-medium text-gray-900 dark:text-base-content">{t('settings.general.auto_check_update')}</div>
+                                        <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{t('settings.general.auto_check_update_desc')}</p>
+                                    </div>
+                                    <label className="relative inline-flex items-center cursor-pointer">
+                                        <input
+                                            type="checkbox"
+                                            className="sr-only peer"
+                                            checked={formData.auto_check_update ?? true}
+                                            onChange={async (e) => {
+                                                const enabled = e.target.checked;
+                                                try {
+                                                    await invoke('save_update_settings', {
+                                                        settings: {
+                                                            auto_check: enabled,
+                                                            last_check_time: 0,
+                                                            check_interval_hours: formData.update_check_interval ?? 24
+                                                        }
+                                                    });
+                                                    setFormData({ ...formData, auto_check_update: enabled });
+                                                    showToast(enabled ? t('settings.general.auto_check_update_enabled') : t('settings.general.auto_check_update_disabled'), 'success');
+                                                } catch (error) {
+                                                    showToast(`${t('common.error')}: ${error}`, 'error');
+                                                }
+                                            }}
+                                        />
+                                        <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
+                                    </label>
                                 </div>
-                                <label className="relative inline-flex items-center cursor-pointer">
-                                    <input
-                                        type="checkbox"
-                                        className="sr-only peer"
-                                        checked={formData.auto_check_update ?? true}
-                                        onChange={async (e) => {
-                                            const enabled = e.target.checked;
-                                            try {
-                                                await invoke('save_update_settings', {
-                                                    settings: {
-                                                        auto_check: enabled,
-                                                        last_check_time: 0,
-                                                        check_interval_hours: formData.update_check_interval ?? 24
-                                                    }
-                                                });
-                                                setFormData({ ...formData, auto_check_update: enabled });
-                                                showToast(enabled ? t('settings.general.auto_check_update_enabled') : t('settings.general.auto_check_update_disabled'), 'success');
-                                            } catch (error) {
-                                                showToast(`${t('common.error')}: ${error}`, 'error');
-                                            }
-                                        }}
-                                    />
-                                    <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
-                                </label>
-                            </div>
 
-                            {/* 检查间隔 */}
-                            {formData.auto_check_update && (
-                                <div className="ml-4">
-                                    <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-2">{t('settings.general.update_check_interval')}</label>
-                                    <input
-                                        type="number"
-                                        className="w-32 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900 dark:text-base-content bg-gray-50 dark:bg-base-200"
-                                        min="1"
-                                        max="168"
-                                        value={formData.update_check_interval ?? 24}
-                                        onChange={(e) => setFormData({ ...formData, update_check_interval: parseInt(e.target.value) })}
-                                        onBlur={async () => {
-                                            try {
-                                                await invoke('save_update_settings', {
-                                                    settings: {
-                                                        auto_check: formData.auto_check_update ?? true,
-                                                        last_check_time: 0,
-                                                        check_interval_hours: formData.update_check_interval ?? 24
-                                                    }
-                                                });
-                                                showToast(t('settings.general.update_check_interval_saved'), 'success');
-                                            } catch (error) {
-                                                showToast(`${t('common.error')}: ${error}`, 'error');
-                                            }
-                                        }}
-                                    />
-                                    <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.general.update_check_interval_desc')}</p>
-                                </div>
-                            )}
+                                {/* 检查间隔 */}
+                                {formData.auto_check_update && (
+                                    <div className="ml-4">
+                                        <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-2">{t('settings.general.update_check_interval')}</label>
+                                        <input
+                                            type="number"
+                                            className="w-32 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900 dark:text-base-content bg-gray-50 dark:bg-base-200"
+                                            min="1"
+                                            max="168"
+                                            value={formData.update_check_interval ?? 24}
+                                            onChange={(e) => setFormData({ ...formData, update_check_interval: parseInt(e.target.value) })}
+                                            onBlur={async () => {
+                                                try {
+                                                    await invoke('save_update_settings', {
+                                                        settings: {
+                                                            auto_check: formData.auto_check_update ?? true,
+                                                            last_check_time: 0,
+                                                            check_interval_hours: formData.update_check_interval ?? 24
+                                                        }
+                                                    });
+                                                    showToast(t('settings.general.update_check_interval_saved'), 'success');
+                                                } catch (error) {
+                                                    showToast(`${t('common.error')}: ${error}`, 'error');
+                                                }
+                                            }}
+                                        />
+                                        <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.general.update_check_interval_desc')}</p>
+                                    </div>
+                                )}
+                            </>
                         </div>
                     )}
 
@@ -538,229 +536,166 @@ function Settings() {
 
                     {/* 高级设置 */}
                     {activeTab === 'advanced' && (
-                        <div className="space-y-4">
-                            <h2 className="text-lg font-semibold text-gray-900 dark:text-base-content">{t('settings.advanced.title')}</h2>
-
-                            {/* 默认导出路径 */}
-                            <div>
-                                <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">{t('settings.advanced.export_path')}</label>
-                                <div className="flex gap-2">
-                                    <input
-                                        type="text"
-                                        className="flex-1 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
-                                        value={formData.default_export_path || t('settings.advanced.export_path_placeholder')}
-                                        readOnly
-                                    />
-                                    {formData.default_export_path && (
-                                        <button
-                                            className="px-4 py-2 border border-gray-200 dark:border-base-300 text-red-600 dark:text-red-400 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors"
-                                            onClick={() => setFormData({ ...formData, default_export_path: undefined })}
-                                        >
-                                            {t('common.clear')}
-                                        </button>
-                                    )}
-                                    <button
-                                        className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 hover:text-gray-900 dark:hover:text-base-content transition-colors"
-                                        onClick={handleSelectExportPath}
-                                    >
-                                        {t('settings.advanced.select_btn')}
-                                    </button>
-                                </div>
-                                <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.advanced.default_export_path_desc')}</p>
-                            </div>
-
-                            {/* 数据目录 */}
-                            <div>
-                                <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">{t('settings.advanced.data_dir')}</label>
-                                <div className="flex gap-2">
-                                    <input
-                                        type="text"
-                                        className="flex-1 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
-                                        value={dataDirPath}
-                                        readOnly
-                                    />
-                                    <button
-                                        className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 hover:text-gray-900 dark:hover:text-base-content transition-colors"
-                                        onClick={handleOpenDataDir}
-                                    >
-                                        {t('settings.advanced.open_btn')}
-                                    </button>
-                                </div>
-                                <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.advanced.data_dir_desc')}</p>
-                            </div>
-
-                            {/* 反重力程序路径 */}
-                            <div>
-                                <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">
-                                    {t('settings.advanced.antigravity_path')}
-                                </label>
-                                <div className="flex gap-2">
-                                    <input
-                                        type="text"
-                                        className="flex-1 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
-                                        value={formData.antigravity_executable || ''}
-                                        placeholder={t('settings.advanced.antigravity_path_placeholder')}
-                                        onChange={(e) => setFormData({ ...formData, antigravity_executable: e.target.value })}
-                                    />
-                                    {formData.antigravity_executable && (
-                                        <button
-                                            className="px-4 py-2 border border-gray-200 dark:border-base-300 text-red-600 dark:text-red-400 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors"
-                                            onClick={() => setFormData({ ...formData, antigravity_executable: undefined })}
-                                        >
-                                            {t('common.clear')}
-                                        </button>
-                                    )}
-                                    <button
-                                        className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors"
-                                        onClick={handleDetectAntigravityPath}
-                                    >
-                                        {t('settings.advanced.detect_btn')}
-                                    </button>
-                                    <button
-                                        className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors"
-                                        onClick={handleSelectAntigravityPath}
-                                    >
-                                        {t('settings.advanced.select_btn')}
-                                    </button>
-                                </div>
-                                <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">
-                                    {t('settings.advanced.antigravity_path_desc')}
-                                </p>
-                            </div>
-
-                            {/* 反重力程序启动参数 */}
-                            <div>
-                                <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">
-                                    {t('settings.advanced.antigravity_args')}
-                                </label>
-                                <div className="flex gap-2">
-                                    <input
-                                        type="text"
-                                        className="flex-1 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
-                                        value={formData.antigravity_args ? formData.antigravity_args.join(' ') : ''}
-                                        placeholder={t('settings.advanced.antigravity_args_placeholder')}
-                                        onChange={(e) => {
-                                            const args = e.target.value.trim() === '' ? [] : e.target.value.split(' ').map(arg => arg.trim()).filter(arg => arg !== '');
-                                            setFormData({ ...formData, antigravity_args: args });
-                                        }}
-                                    />
-                                    <button
-                                        className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors"
-                                        onClick={async () => {
-                                            try {
-                                                const args = await invoke<string[]>('get_antigravity_args');
-                                                setFormData({ ...formData, antigravity_args: args });
-                                                showToast(t('settings.advanced.antigravity_args_detected'), 'success');
-                                            } catch (error) {
-                                                showToast(`${t('settings.advanced.antigravity_args_detect_error')}: ${error}`, 'error');
-                                            }
-                                        }}
-                                    >
-                                        {t('settings.advanced.detect_args_btn')}
-                                    </button>
-                                </div>
-                                <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">
-                                    {t('settings.advanced.antigravity_args_desc')}
-                                </p>
-                            </div>
-
-                            {/* HTTP API 设置 */}
-                            <div className="border-t border-gray-200 dark:border-base-200 pt-4">
-                                <h3 className="font-medium text-gray-900 dark:text-base-content mb-3">{t('settings.advanced.http_api_title')}</h3>
-                                <div className="bg-gray-50 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-lg p-4 space-y-4">
-                                    <p className="text-sm text-gray-600 dark:text-gray-400">{t('settings.advanced.http_api_desc')}</p>
-
-                                    {/* 启用开关 */}
-                                    <div className="flex items-center justify-between">
-                                        <div>
-                                            <div className="font-medium text-gray-900 dark:text-base-content">{t('settings.advanced.http_api_enabled')}</div>
-                                            <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{t('settings.advanced.http_api_enabled_desc')}</p>
-                                        </div>
-                                        <label className="relative inline-flex items-center cursor-pointer">
-                                            <input
-                                                type="checkbox"
-                                                className="sr-only peer"
-                                                checked={httpApiSettings.enabled}
-                                                onChange={(e) => {
-                                                    setHttpApiSettings(prev => ({ ...prev, enabled: e.target.checked }));
-                                                    setHttpApiSettingsChanged(true);
-                                                }}
-                                            />
-                                            <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
-                                        </label>
+                        <>
+                            <div className="space-y-4">
+                                {/* 默认导出路径 */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">{t('settings.advanced.export_path')}</label>
+                                    <div className="flex gap-2">
+                                        <input
+                                            type="text"
+                                            className="flex-1 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
+                                            value={formData.default_export_path || t('settings.advanced.export_path_placeholder')}
+                                            readOnly
+                                        />
+                                        {formData.default_export_path && (
+                                            <button
+                                                className="px-4 py-2 border border-gray-200 dark:border-base-300 text-red-600 dark:text-red-400 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors"
+                                                onClick={() => setFormData({ ...formData, default_export_path: undefined })}
+                                            >
+                                                {t('common.clear')}
+                                            </button>
+                                        )}
+                                        {isTauri() ? (
+                                            <button
+                                                className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 hover:text-gray-900 dark:hover:text-base-content transition-colors"
+                                                onClick={handleSelectExportPath}
+                                            >
+                                                {t('settings.advanced.select_btn')}
+                                            </button>
+                                        ) : (
+                                            <span className="self-center text-xs text-gray-400 dark:text-gray-500 italic px-2">
+                                                {t('settings.web_mode_limitation', '(Web 模式不支持)')}
+                                            </span>
+                                        )}
                                     </div>
+                                    <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.advanced.default_export_path_desc')}</p>
+                                </div>
 
-                                    {/* 端口配置 */}
-                                    {httpApiSettings.enabled && (
-                                        <div className="mt-4">
-                                            <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-2">{t('settings.advanced.http_api_port')}</label>
-                                            <div className="flex gap-2">
-                                                <input
-                                                    type="number"
-                                                    className="w-32 px-4 py-2 border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900 dark:text-base-content bg-white dark:bg-base-200"
-                                                    min="1024"
-                                                    max="65535"
-                                                    value={httpApiPortInput}
-                                                    onChange={(e) => {
-                                                        setHttpApiPortInput(e.target.value);
-                                                        const port = parseInt(e.target.value);
-                                                        if (port >= 1024 && port <= 65535) {
-                                                            setHttpApiSettings(prev => ({ ...prev, port }));
-                                                            setHttpApiSettingsChanged(true);
-                                                        }
-                                                    }}
-                                                    placeholder={t('settings.advanced.http_api_port_placeholder')}
-                                                />
-                                                <button
-                                                    className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                                    disabled={!httpApiSettingsChanged}
-                                                    onClick={async () => {
-                                                        const port = parseInt(httpApiPortInput);
-                                                        if (port < 1024 || port > 65535) {
-                                                            showToast(t('settings.advanced.http_api_port_invalid'), 'error');
-                                                            return;
-                                                        }
-                                                        try {
-                                                            await invoke('save_http_api_settings', {
-                                                                settings: httpApiSettings
-                                                            });
-                                                            setHttpApiSettingsChanged(false);
-                                                            showToast(t('settings.advanced.http_api_settings_saved'), 'success');
-                                                        } catch (error) {
-                                                            showToast(`${t('common.error')}: ${error}`, 'error');
-                                                        }
-                                                    }}
-                                                >
-                                                    {t('common.save')}
-                                                </button>
-                                            </div>
-                                            <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.advanced.http_api_port_desc')}</p>
-                                            {httpApiSettingsChanged && (
-                                                <p className="text-sm text-orange-500 dark:text-orange-400 mt-2">{t('settings.advanced.http_api_restart_required')}</p>
-                                            )}
-                                        </div>
-                                    )}
+                                {/* 数据目录 */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">{t('settings.advanced.data_dir')}</label>
+                                    <div className="flex gap-2">
+                                        <input
+                                            type="text"
+                                            className="flex-1 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
+                                            value={dataDirPath}
+                                            readOnly
+                                        />
+                                        {isTauri() ? (
+                                            <button
+                                                className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 hover:text-gray-900 dark:hover:text-base-content transition-colors"
+                                                onClick={handleOpenDataDir}
+                                            >
+                                                {t('settings.advanced.open_btn')}
+                                            </button>
+                                        ) : (
+                                            <span className="self-center text-xs text-gray-400 dark:text-gray-500 italic px-2">
+                                                {t('settings.web_mode_limitation', '(Web 模式不支持)')}
+                                            </span>
+                                        )}
+                                    </div>
+                                    <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.advanced.data_dir_desc')}</p>
+                                </div>
+
+                                {/* 反重力程序路径 */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">
+                                        {t('settings.advanced.antigravity_path')}
+                                    </label>
+                                    <div className="flex gap-2">
+                                        <input
+                                            type="text"
+                                            className="flex-1 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
+                                            value={formData.antigravity_executable || ''}
+                                            placeholder={t('settings.advanced.antigravity_path_placeholder')}
+                                            onChange={(e) => setFormData({ ...formData, antigravity_executable: e.target.value })}
+                                        />
+                                        {formData.antigravity_executable && (
+                                            <button
+                                                className="px-4 py-2 border border-gray-200 dark:border-base-300 text-red-600 dark:text-red-400 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors"
+                                                onClick={() => setFormData({ ...formData, antigravity_executable: undefined })}
+                                            >
+                                                {t('common.clear')}
+                                            </button>
+                                        )}
+                                        <button
+                                            className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors"
+                                            onClick={handleDetectAntigravityPath}
+                                        >
+                                            {t('settings.advanced.detect_btn')}
+                                        </button>
+                                        {isTauri() ? (
+                                            <button
+                                                className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors"
+                                                onClick={handleSelectAntigravityPath}
+                                            >
+                                                {t('settings.advanced.select_btn')}
+                                            </button>
+                                        ) : (
+                                            <span className="self-center text-xs text-gray-400 dark:text-gray-500 italic px-2">
+                                                {t('settings.web_mode_limitation', '(Web 模式不支持)')}
+                                            </span>
+                                        )}
+                                    </div>
+                                    <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">
+                                        {t('settings.advanced.antigravity_path_desc')}
+                                    </p>
+                                </div>
+
+                                {/* 反重力程序启动参数 */}
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">
+                                        {t('settings.advanced.antigravity_args')}
+                                    </label>
+                                    <div className="flex gap-2">
+                                        <input
+                                            type="text"
+                                            className="flex-1 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
+                                            value={formData.antigravity_args ? formData.antigravity_args.join(' ') : ''}
+                                            placeholder={t('settings.advanced.antigravity_args_placeholder')}
+                                            onChange={(e) => {
+                                                const args = e.target.value.trim() === '' ? [] : e.target.value.split(' ').map(arg => arg.trim()).filter(arg => arg !== '');
+                                                setFormData({ ...formData, antigravity_args: args });
+                                            }}
+                                        />
+                                        <button
+                                            className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-base-200 transition-colors"
+                                            onClick={async () => {
+                                                try {
+                                                    const args = await invoke<string[]>('get_antigravity_args');
+                                                    setFormData({ ...formData, antigravity_args: args });
+                                                    showToast(t('settings.advanced.antigravity_args_detected'), 'success');
+                                                } catch (error) {
+                                                    showToast(`${t('settings.advanced.antigravity_args_detect_error')}: ${error}`, 'error');
+                                                }
+                                            }}
+                                        >
+                                            {t('settings.advanced.detect_args_btn')}
+                                        </button>
+                                    </div>
+                                    <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">
+                                        {t('settings.advanced.antigravity_args_desc')}
+                                    </p>
+                                </div>
+
+                                {/* 日志缓存清理 */}
+                                <div className="border-t border-gray-200 dark:border-base-200 pt-4">
+                                    <h3 className="font-medium text-gray-900 dark:text-base-content mb-3">{t('settings.advanced.logs_title')}</h3>
+                                    <div className="bg-gray-50 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-lg p-3 mb-3">
+                                        <p className="text-sm text-gray-600 dark:text-gray-400">{t('settings.advanced.logs_desc')}</p>
+                                    </div>
+                                    <div className="flex items-center gap-4">
+                                        <button
+                                            className="px-4 py-2 border border-gray-300 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-base-200 transition-colors"
+                                            onClick={() => setIsClearLogsOpen(true)}
+                                        >
+                                            {t('settings.advanced.clear_logs')}
+                                        </button>
+                                    </div>
                                 </div>
                             </div>
-
-                            <div className="border-t border-gray-200 dark:border-base-200 pt-4">
-                                <h3 className="font-medium text-gray-900 dark:text-base-content mb-3">{t('settings.advanced.logs_title')}</h3>
-                                <div className="bg-gray-50 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-lg p-3 mb-3">
-                                    <p className="text-sm text-gray-600 dark:text-gray-400">{t('settings.advanced.logs_desc')}</p>
-                                </div>
-                                <div className="badge badge-primary badge-outline gap-2 font-mono">
-                                    v3.3.50
-                                </div>
-                                <div className="flex items-center gap-4">
-                                    <button
-                                        className="px-4 py-2 border border-gray-300 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-base-200 transition-colors"
-                                        onClick={() => setIsClearLogsOpen(true)}
-                                    >
-                                        {t('settings.advanced.clear_logs')}
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
+                        </>
                     )}
 
                     {/* 代理设置 */}
@@ -851,7 +786,7 @@ function Settings() {
                                         <h3 className="text-3xl font-black text-gray-900 dark:text-base-content tracking-tight mb-2">Antigravity Tools</h3>
                                         <div className="flex items-center justify-center gap-2 text-sm">
                                             <span className="px-2.5 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 font-medium border border-blue-200 dark:border-blue-800">
-                                                v3.3.50
+                                                v4.0.2
                                             </span>
                                             <span className="text-gray-400 dark:text-gray-600">•</span>
                                             <span className="text-gray-500 dark:text-gray-400">Professional Account Management</span>
@@ -1040,7 +975,7 @@ function Settings() {
                     <div className="modal-backdrop bg-black/60 backdrop-blur-md fixed inset-0 z-[-1]" onClick={() => setIsSupportModalOpen(false)}></div>
                 </div>
             </div>
-        </div>
+        </div >
     );
 }
 

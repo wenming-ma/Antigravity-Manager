@@ -4,12 +4,11 @@ import { Sun, Moon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useConfigStore } from '../../stores/useConfigStore';
 
-// Detect if running on Linux platform
-const isLinux = navigator.userAgent.toLowerCase().includes('linux');
+import { isTauri, isLinux } from '../../utils/env';
 
 function Navbar() {
     const location = useLocation();
-    const { t, i18n } = useTranslation();
+    const { t } = useTranslation();
     const { config, saveConfig } = useConfigStore();
 
     const navItems = [
@@ -34,7 +33,7 @@ function Navbar() {
         const newTheme = config.theme === 'light' ? 'dark' : 'light';
 
         // Use View Transition API if supported, but skip on Linux (may cause crash)
-        if ('startViewTransition' in document && !isLinux) {
+        if ('startViewTransition' in document && !isLinux()) {
             const x = event.clientX;
             const y = event.clientY;
             const endRadius = Math.hypot(
@@ -44,11 +43,13 @@ function Navbar() {
 
             // @ts-ignore
             const transition = document.startViewTransition(async () => {
-                await saveConfig({
+                // Just let the state change trigger the transition
+                // No need to await the IPC call inside the transition block
+                saveConfig({
                     ...config,
                     theme: newTheme,
                     language: config.language
-                });
+                }, true);
             });
 
             transition.ready.then(() => {
@@ -75,7 +76,7 @@ function Navbar() {
                 ...config,
                 theme: newTheme,
                 language: config.language
-            });
+            }, true);
         }
     };
 
@@ -114,8 +115,7 @@ function Navbar() {
             ...config,
             language: langCode,
             theme: config.theme
-        });
-        i18n.changeLanguage(langCode);
+        }, true);
         setIsLangOpen(false);
     };
 
@@ -125,11 +125,13 @@ function Navbar() {
             className="pt-9 transition-all duration-200 bg-[#FAFBFC] dark:bg-base-300"
         >
             {/* 窗口拖拽区域 2 - 覆盖导航栏内容区域（在交互元素下方） */}
-            <div
-                className="absolute top-9 left-0 right-0 h-16"
-                style={{ zIndex: 5, backgroundColor: 'rgba(0,0,0,0.001)' }}
-                data-tauri-drag-region
-            />
+            {isTauri() && (
+                <div
+                    className="absolute top-9 left-0 right-0 h-16"
+                    style={{ zIndex: 5, backgroundColor: 'rgba(0,0,0,0.001)' }}
+                    data-tauri-drag-region
+                />
+            )}
 
             <div className="max-w-7xl mx-auto px-8 relative" style={{ zIndex: 10 }}>
                 <div className="flex items-center justify-between h-16">

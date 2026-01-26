@@ -43,7 +43,14 @@ pub fn init_logger() {
     let file_appender = tracing_appender::rolling::daily(log_dir, "app.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     
-    // 2. File output layer (disable ANSI formatting, use local timezone)
+    // 2. Console output layer (using local timezone)
+    let console_layer = fmt::Layer::new()
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_level(true)
+        .with_timer(LocalTimer);
+        
+    // 3. File output layer (disable ANSI formatting, use local timezone)
     let file_layer = fmt::Layer::new()
         .with_writer(non_blocking)
         .with_ansi(false)
@@ -51,13 +58,14 @@ pub fn init_logger() {
         .with_level(true)
         .with_timer(LocalTimer);
 
-    // 3. Set filtering layer (default to INFO level to reduce log size)
+    // 4. Set filtering layer (default to INFO level to reduce log size)
     let filter_layer = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // 4. Initialize global subscriber (use try_init to avoid crash on repeated initialization)
+    // 5. Initialize global subscriber (use try_init to avoid crash on repeated initialization)
     let _ = tracing_subscriber::registry()
         .with(filter_layer)
+        .with(console_layer)
         .with(file_layer)
         .try_init();
 
@@ -65,7 +73,7 @@ pub fn init_logger() {
     // Recommended practice when using tracing_appender::non_blocking (if manual flushing is not needed)
     std::mem::forget(_guard);
     
-    info!("Log system initialized (File persistence)");
+    info!("Log system initialized (Console + File persistence)");
     
     // Auto-cleanup logs older than 7 days
     if let Err(e) = cleanup_old_logs(7) {
