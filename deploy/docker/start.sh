@@ -34,7 +34,7 @@ RATE_LIMIT=$(wget -qO- --timeout=10 --header="Accept: application/vnd.github.v3+
     "https://api.github.com/rate_limit" 2>/dev/null | grep -o '"remaining":[0-9]*' | head -1 | cut -d: -f2 || echo "0")
 
 if [ "${RATE_LIMIT:-0}" -gt 5 ]; then
-    LATEST_URL=$(wget -qO- --timeout=30 https://api.github.com/repos/lbjlaq/Antigravity-Manager/releases/latest \
+    LATEST_URL=$(wget -qO- --timeout=30 https://api.github.com/repos/wenming-ma/Antigravity-Manager/releases/latest \
         | grep "browser_download_url.*_${ARCH}.deb" \
         | cut -d '"' -f 4 || echo "")
 
