@@ -343,6 +343,8 @@ impl AxumServer {
             .route("/proxy/mapping", post(admin_update_model_mapping))
             .route("/proxy/api-key/generate", post(admin_generate_api_key))
             .route("/proxy/session-bindings/clear", post(admin_clear_proxy_session_bindings))
+            .route("/proxy/rate-limits", delete(admin_clear_all_rate_limits))
+            .route("/proxy/rate-limits/:accountId", delete(admin_clear_rate_limit))
             .route(
                 "/proxy/preferred-account",
                 get(admin_get_preferred_account).post(admin_set_preferred_account),
@@ -1098,6 +1100,27 @@ async fn admin_clear_proxy_session_bindings(
     StatusCode::OK
 }
 
+async fn admin_clear_all_rate_limits(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    state.token_manager.clear_all_rate_limits();
+    logger::log_info("[API] 已清除所有限流记录");
+    StatusCode::OK
+}
+
+async fn admin_clear_rate_limit(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+) -> impl IntoResponse {
+    let cleared = state.token_manager.clear_rate_limit(&account_id);
+    if cleared {
+        logger::log_info(&format!("[API] 已清除账号 {} 的限流记录", account_id));
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
 async fn admin_get_preferred_account(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -1800,7 +1823,6 @@ async fn handle_oauth_callback(
     let code = params.code;
 
     // Exchange token
-    // 我们需要在这里直接完成 token 交换
     let port = state.security.read().await.port;
     let host = headers.get("host").and_then(|h| h.to_str().ok());
     let proto = headers.get("x-forwarded-proto").and_then(|h| h.to_str().ok());
@@ -1808,26 +1830,16 @@ async fn handle_oauth_callback(
 
     match state.token_manager.exchange_code(&code, &redirect_uri).await {
         Ok(refresh_token) => {
-            // 获取邮箱 (可选，TokenManager.add_account 内部会再获取一次用户信息，这里主要是为了快速响应)
-            // 为了简化，我们直接调用 add_account，它会处理一切
-            
-            // 下面这段逻辑模拟了 modules::account::add_account 的行为
-            // 但为了复用，我们最好直接调用 TokenManager 的方法，或者 modules::account 的方法
-            // 由于 modules::account::add_account 依赖 AppHandle (Tauri), 这里我们不能直接用。
-            // 必须依赖 TokenManager 的纯 Rust 实现。
-            
-            // 1. 获取用户信息
-             match state.token_manager.get_user_info(&refresh_token).await {
+            match state.token_manager.get_user_info(&refresh_token).await {
                 Ok(user_info) => {
-                     let email = user_info.email;
-                     // 2. 添加到 TokenManager (内部会保存)
-                     if let Err(e) = state.token_manager.add_account(&email, &refresh_token).await {
+                    let email = user_info.email;
+                    if let Err(e) = state.token_manager.add_account(&email, &refresh_token).await {
                         error!("Failed to add account: {}", e);
-                         return Ok(Html(format!(
+                        return Ok(Html(format!(
                             r#"<html><body><h1>Authorization Failed</h1><p>Failed to save account: {}</p></body></html>"#,
                             e
                         )));
-                     }
+                    }
                 }
                 Err(e) => {
                     error!("Failed to get user info: {}", e);
@@ -1836,33 +1848,60 @@ async fn handle_oauth_callback(
                         e
                     )));
                 }
-             }
+            }
 
             // Success HTML
-             Ok(Html(format!(r#"
+            Ok(Html(format!(r#"
                 <!DOCTYPE html>
                 <html>
                 <head>
                     <title>Authorization Successful</title>
                     <style>
-                        body {{ font-family: system-ui, -apple-system, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background-color: #f9fafb; }}
-                        .card {{ background: white; padding: 2rem; border-radius: 1rem; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); text-align: center; }}
-                        h1 {{ color: #059669; margin-bottom: 0.5rem; }}
-                        p {{ color: #4b5563; }}
+                        body {{ font-family: system-ui, -apple-system, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background-color: #f9fafb; padding: 20px; box-sizing: border-box; }}
+                        .card {{ background: white; padding: 2rem; border-radius: 1.5rem; box-shadow: 0 10px 25px -5px rgb(0 0 0 / 0.1); text-align: center; max-width: 500px; width: 100%; }}
+                        .icon {{ font-size: 3rem; margin-bottom: 1rem; }}
+                        h1 {{ color: #059669; margin: 0 0 1rem 0; font-size: 1.5rem; }}
+                        p {{ color: #4b5563; line-height: 1.5; margin-bottom: 1.5rem; }}
+                        .fallback-box {{ background-color: #f3f4f6; padding: 1.25rem; border-radius: 1rem; border: 1px dashed #d1d5db; text-align: left; margin-top: 1.5rem; }}
+                        .fallback-title {{ font-weight: 600; font-size: 0.875rem; color: #1f2937; margin-bottom: 0.5rem; display: block; }}
+                        .fallback-text {{ font-size: 0.75rem; color: #6b7280; margin-bottom: 1rem; display: block; }}
+                        .copy-btn {{ width: 100%; padding: 0.75rem; background-color: #3b82f6; color: white; border: none; border-radius: 0.75rem; font-weight: 500; cursor: pointer; transition: background-color 0.2s; }}
+                        .copy-btn:hover {{ background-color: #2563eb; }}
                     </style>
                 </head>
                 <body>
                     <div class="card">
+                        <div class="icon">✅</div>
                         <h1>Authorization Successful</h1>
-                        <p>You can close this window now.</p>
+                        <p>You can close this window now. The application should refresh automatically.</p>
+                        
+                        <div class="fallback-box">
+                            <span class="fallback-title">💡 Did it not refresh?</span>
+                            <span class="fallback-text">If the application is running in a container or remote environment, you may need to manually copy the link below:</span>
+                            <button onclick="copyUrl()" class="copy-btn" id="copyBtn">Copy Completion Link</button>
+                        </div>
                     </div>
                     <script>
+                        // 1. Notify opener if exists
                         if (window.opener) {{
                             window.opener.postMessage({{
                                 type: 'oauth-success',
                                 message: 'login success'
                             }}, '*');
-                            // window.close(); // Optional: Auto close
+                        }}
+
+                        // 2. Copy URL functionality
+                        function copyUrl() {{
+                            navigator.clipboard.writeText(window.location.href).then(() => {{
+                                const btn = document.getElementById('copyBtn');
+                                const originalText = btn.innerText;
+                                btn.innerText = '✅ Link Copied!';
+                                btn.style.backgroundColor = '#059669';
+                                setTimeout(() => {{
+                                    btn.innerText = originalText;
+                                    btn.style.backgroundColor = '#3b82f6';
+                                }}, 2000);
+                            }});
                         }}
                     </script>
                 </body>
@@ -1889,9 +1928,55 @@ async fn admin_prepare_oauth_url_web(
     let redirect_uri = get_oauth_redirect_uri(port, host, proto);
     
     let state_str = uuid::Uuid::new_v4().to_string();
-    let url = state.token_manager.get_oauth_url_with_redirect(&redirect_uri, &state_str);
+    
+    // 初始化授权流状态，以及后台处理器
+    let (auth_url, mut code_rx) = crate::modules::oauth_server::prepare_oauth_flow_manually(redirect_uri.clone(), state_str.clone())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+
+    // 启动后台任务处理回调/手动提交的代码
+    let token_manager = state.token_manager.clone();
+    let redirect_uri_clone = redirect_uri.clone();
+    tokio::spawn(async move {
+        match code_rx.recv().await {
+            Some(Ok(code)) => {
+                crate::modules::logger::log_info("Consuming manually submitted OAuth code in background");
+                // 为 Web 回调提供简化的后端处理流程
+                match crate::modules::oauth::exchange_code(&code, &redirect_uri_clone).await {
+                    Ok(token_resp) => {
+                        // Success! Now add/upsert account
+                        if let Some(refresh_token) = &token_resp.refresh_token {
+                            match token_manager.get_user_info(refresh_token).await {
+                                Ok(user_info) => {
+                                    if let Err(e) = token_manager.add_account(&user_info.email, refresh_token).await {
+                                        crate::modules::logger::log_error(&format!("Failed to save account in background OAuth: {}", e));
+                                    } else {
+                                        crate::modules::logger::log_info(&format!("Successfully added account {} via background OAuth", user_info.email));
+                                    }
+                                }
+                                Err(e) => {
+                                    crate::modules::logger::log_error(&format!("Failed to fetch user info in background OAuth: {}", e));
+                                }
+                            }
+                        } else {
+                            crate::modules::logger::log_error("Background OAuth error: Google did not return a refresh_token.");
+                        }
+                    }
+                    Err(e) => {
+                        crate::modules::logger::log_error(&format!("Background OAuth exchange failed: {}", e));
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                crate::modules::logger::log_error(&format!("Background OAuth flow error: {}", e));
+            }
+            None => {
+                crate::modules::logger::log_info("Background OAuth flow channel closed");
+            }
+        }
+    });
+
     Ok(Json(serde_json::json!({ 
-        "url": url,
+        "url": auth_url,
         "state": state_str
     })))
 }

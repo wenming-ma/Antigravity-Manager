@@ -294,6 +294,7 @@ pub fn run() {
             commands::open_data_folder,
             commands::get_data_dir_path,
             commands::show_main_window,
+            commands::set_window_theme,
             commands::get_antigravity_path,
             commands::get_antigravity_args,
             commands::check_for_updates,
@@ -326,6 +327,8 @@ pub fn run() {
             commands::proxy::clear_proxy_session_bindings,
             commands::proxy::set_preferred_account,
             commands::proxy::get_preferred_account,
+            commands::proxy::clear_proxy_rate_limit,
+            commands::proxy::clear_all_proxy_rate_limits,
             // Autostart commands
             commands::autostart::toggle_auto_launch,
             commands::autostart::is_auto_launch_enabled,

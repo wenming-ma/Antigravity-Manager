@@ -53,11 +53,11 @@ impl TokenManager {
         }
     }
 
-    /// 启动限流记录自动清理后台任务（每60秒检查并清除过期记录）
+    /// 启动限流记录自动清理后台任务（每15秒检查并清除过期记录）
     pub fn start_auto_cleanup(&self) {
         let tracker = self.rate_limit_tracker.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
             loop {
                 interval.tick().await;
                 let cleaned = tracker.cleanup_expired();
@@ -66,7 +66,7 @@ impl TokenManager {
                 }
             }
         });
-        tracing::info!("✅ Rate limit auto-cleanup task started (interval: 60s)");
+        tracing::info!("✅ Rate limit auto-cleanup task started (interval: 15s)");
     }
     
     /// 从主应用账号目录加载所有账号
@@ -127,6 +127,8 @@ impl TokenManager {
         match self.load_single_account(&path).await {
             Ok(Some(token)) => {
                 self.tokens.insert(account_id.to_string(), token);
+                // [NEW] 重新加载账号时自动清除该账号的限流记录
+                self.clear_rate_limit(account_id);
                 Ok(())
             }
             Ok(None) => Err("账号加载失败".to_string()),
@@ -136,7 +138,10 @@ impl TokenManager {
 
     /// 重新加载所有账号
     pub async fn reload_all_accounts(&self) -> Result<usize, String> {
-        self.load_accounts().await
+        let count = self.load_accounts().await?;
+        // [NEW] 重新加载所有账号时自动清除所有限流记录
+        self.clear_all_rate_limits();
+        Ok(count)
     }
     
     /// 加载单个账号
@@ -1141,9 +1146,13 @@ impl TokenManager {
     }
     
     /// 清除指定账号的限流记录
-    #[allow(dead_code)]
     pub fn clear_rate_limit(&self, account_id: &str) -> bool {
         self.rate_limit_tracker.clear(account_id)
+    }
+
+    /// 清除所有限流记录
+    pub fn clear_all_rate_limits(&self) {
+        self.rate_limit_tracker.clear_all();
     }
     
     /// 标记账号请求成功，重置连续失败计数
@@ -1516,10 +1525,10 @@ impl TokenManager {
                 None, // session_id
             );
             
-            crate::modules::account::add_account(email_clone, None, token_data)
+            crate::modules::account::upsert_account(email_clone, None, token_data)
         }).await
         .map_err(|e| format!("Task join error: {}", e))?
-        .map_err(|e| format!("Failed to add account: {}", e))?;
+        .map_err(|e| format!("Failed to save account: {}", e))?;
 
         // 4. 重新加载 (更新内存)
         self.reload_all_accounts().await.map(|_| ())
