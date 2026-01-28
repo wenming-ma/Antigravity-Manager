@@ -1,6 +1,6 @@
 use crate::proxy::TokenManager;
 use axum::{
-    extract::{Path, State, Query},
+    extract::{DefaultBodyLimit, Path, State, Query},
     http::{StatusCode, HeaderMap},
     response::{IntoResponse, Json, Response, Html},
     routing::{any, get, post, delete},
@@ -351,6 +351,7 @@ impl AxumServer {
             .route("/accounts/oauth/start", post(admin_start_oauth_login))
             .route("/accounts/oauth/complete", post(admin_complete_oauth_login))
             .route("/accounts/oauth/cancel", post(admin_cancel_oauth_login))
+            .route("/accounts/oauth/submit-code", post(admin_submit_oauth_code))
             .route("/zai/models/fetch", post(admin_fetch_zai_models))
             .route("/proxy/monitor/toggle", post(admin_set_proxy_monitor_enabled))
             .route("/proxy/cloudflared/status", get(admin_cloudflared_get_status))
@@ -413,6 +414,13 @@ impl AxumServer {
             .layer(axum::middleware::from_fn_with_state(state.clone(), admin_auth_middleware));
 
         // 3. 整合并应用全局层
+        // 从环境变量读取 body 大小限制，默认 50MB
+        let max_body_size: usize = std::env::var("ABV_MAX_BODY_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100 * 1024 * 1024); // 默认 100MB
+        tracing::info!("请求体大小限制: {} MB", max_body_size / 1024 / 1024);
+
         let app = Router::new()
             .nest("/api", admin_routes)
             .merge(proxy_routes)
@@ -421,6 +429,7 @@ impl AxumServer {
             // 应用全局监控与状态层 (外层)
             .layer(axum::middleware::from_fn_with_state(state.clone(), service_status_middleware))
             .layer(cors_layer())
+            .layer(DefaultBodyLimit::max(max_body_size)) // 放宽 body 大小限制
             .with_state(state.clone());
 
         // 静态文件托管 (用于 Headless/Docker 模式)
@@ -647,6 +656,11 @@ async fn admin_add_account(
         )
     })?;
 
+    // [FIX #1166] 账号变动后立即重新加载 TokenManager
+    if let Err(e) = state.token_manager.load_accounts().await {
+        logger::log_error(&format!("[API] Failed to reload accounts after adding: {}", e));
+    }
+
     let current_id = state.account_service.get_current_id().map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e }))
     })?;
@@ -663,6 +677,11 @@ async fn admin_delete_account(
             Json(ErrorResponse { error: e }),
         )
     })?;
+
+    // [FIX #1166] 账号变动后立即重新加载 TokenManager
+    if let Err(e) = state.token_manager.load_accounts().await {
+        logger::log_error(&format!("[API] Failed to reload accounts after deletion: {}", e));
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -707,6 +726,13 @@ async fn admin_switch_account(
     match result {
         Ok(()) => {
             logger::log_info(&format!("[API] Account switch successful: {}", account_id));
+            
+            // [FIX #1166] 账号切换后立即同步内存状态
+            state.token_manager.clear_all_sessions();
+            if let Err(e) = state.token_manager.load_accounts().await {
+                logger::log_error(&format!("[API] Failed to reload accounts after switch: {}", e));
+            }
+            
             Ok(StatusCode::OK)
         }
         Err(e) => {
@@ -767,6 +793,25 @@ async fn admin_cancel_oauth_login(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     state.account_service.cancel_oauth_login();
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct SubmitCodeRequest {
+    code: String,
+    state: Option<String>,
+}
+
+async fn admin_submit_oauth_code(
+    State(state): State<AppState>,
+    Json(payload): Json<SubmitCodeRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    state.account_service.submit_oauth_code(payload.code, payload.state).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
     Ok(StatusCode::OK)
 }
 
@@ -974,18 +1019,35 @@ async fn admin_get_proxy_status(
 async fn admin_start_proxy_service(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    // 1. 持久化配置 (修复 #1166)
+    if let Ok(mut config) = crate::modules::config::load_app_config() {
+        config.proxy.auto_start = true;
+        let _ = crate::modules::config::save_app_config(&config);
+    }
+
+    // 2. 确保账号已加载 (如果是第一次启动)
+    if let Err(e) = state.token_manager.load_accounts().await {
+        logger::log_error(&format!("[API] 启用服务并加载账号失败: {}", e));
+    }
+
     let mut running = state.is_running.write().await;
     *running = true;
-    logger::log_info("[API] 反代服务功能已启用");
+    logger::log_info("[API] 反代服务功能已启用 (持久化已同步)");
     StatusCode::OK
 }
 
 async fn admin_stop_proxy_service(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    // 1. 持久化配置 (修复 #1166)
+    if let Ok(mut config) = crate::modules::config::load_app_config() {
+        config.proxy.auto_start = false;
+        let _ = crate::modules::config::save_app_config(&config);
+    }
+
     let mut running = state.is_running.write().await;
     *running = false;
-    logger::log_info("[API] 反代服务功能已禁用 (Axum 模式)");
+    logger::log_info("[API] 反代服务功能已禁用 (Axum 模式 / 持久化已同步)");
     StatusCode::OK
 }
 
@@ -1330,10 +1392,17 @@ struct ReorderRequest {
 }
 
 async fn admin_reorder_accounts(
+    State(state): State<AppState>,
     Json(payload): Json<ReorderRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     crate::modules::account::reorder_accounts(&payload.account_ids)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+    
+    // [FIX #1166] 排序变动后立即重新加载 TokenManager
+    if let Err(e) = state.token_manager.load_accounts().await {
+        logger::log_error(&format!("[API] Failed to reload accounts after reorder: {}", e));
+    }
+
     Ok(StatusCode::OK)
 }
 
@@ -1565,12 +1634,16 @@ async fn admin_open_folder() -> Result<impl IntoResponse, (StatusCode, Json<Erro
 // --- Import Handlers ---
 
 async fn admin_import_v1_accounts(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let accounts = migration::import_from_v1().await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e }))
     })?;
-    let current_id = _state.account_service.get_current_id().map_err(|e| {
+    
+    // [FIX #1166] 导入后立即加载
+    let _ = state.token_manager.load_accounts().await;
+
+    let current_id = state.account_service.get_current_id().map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e }))
     })?;
     let responses: Vec<AccountResponse> = accounts.iter().map(|a| to_account_response(a, &current_id)).collect();
@@ -1578,12 +1651,16 @@ async fn admin_import_v1_accounts(
 }
 
 async fn admin_import_from_db(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let account = migration::import_from_db().await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e }))
     })?;
-    let current_id = _state.account_service.get_current_id().map_err(|e| {
+
+    // [FIX #1166] 导入后立即加载
+    let _ = state.token_manager.load_accounts().await;
+
+    let current_id = state.account_service.get_current_id().map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e }))
     })?;
     Ok(Json(to_account_response(&account, &current_id)))
@@ -1595,25 +1672,29 @@ struct CustomDbRequest {
 }
 
 async fn admin_import_custom_db(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(payload): Json<CustomDbRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let account = migration::import_from_custom_db_path(payload.path).await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e }))
     })?;
-    let current_id = _state.account_service.get_current_id().map_err(|e| {
+
+    // [FIX #1166] 导入后立即加载
+    let _ = state.token_manager.load_accounts().await;
+
+    let current_id = state.account_service.get_current_id().map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e }))
     })?;
     Ok(Json(to_account_response(&account, &current_id)))
 }
 
 async fn admin_sync_account_from_db(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     // 逻辑参考自 sync_account_from_db command
     let db_refresh_token = match migration::get_refresh_token_from_db() {
         Ok(token) => token,
-        Err(e) => {
+        Err(_e) => {
             return Ok(Json(None));
         }
     };
@@ -1630,11 +1711,16 @@ async fn admin_sync_account_from_db(
     let account = migration::import_from_db().await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e }))
     })?;
-    let current_id = _state.account_service.get_current_id().map_err(|e| {
+
+    // [FIX #1166] 同步后立即重新加载 TokenManager
+    let _ = state.token_manager.load_accounts().await;
+
+    let current_id = state.account_service.get_current_id().map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e }))
     })?;
     Ok(Json(Some(to_account_response(&account, &current_id))))
 }
+
 
 // --- CLI Sync Handlers ---
 
@@ -1802,21 +1888,23 @@ async fn admin_prepare_oauth_url_web(
     let proto = headers.get("x-forwarded-proto").and_then(|h| h.to_str().ok());
     let redirect_uri = get_oauth_redirect_uri(port, host, proto);
     
-    let url = state.token_manager.get_oauth_url_with_redirect(&redirect_uri);
-    Ok(Json(serde_json::json!({ "url": url })))
+    let state_str = uuid::Uuid::new_v4().to_string();
+    let url = state.token_manager.get_oauth_url_with_redirect(&redirect_uri, &state_str);
+    Ok(Json(serde_json::json!({ 
+        "url": url,
+        "state": state_str
+    })))
 }
 
 /// 辅助函数：获取 OAuth 重定向 URI
-/// 优先使用 ABV_PUBLIC_URL 环境变量 (例如 https://abv.example.com)
-fn get_oauth_redirect_uri(port: u16, host: Option<&str>, proto: Option<&str>) -> String {
+/// 强制使用 localhost，以绕过 Google 2.0 政策对 IP 地址和非 HTTPS 环境的拦截。
+/// 只有在显式设置了 ABV_PUBLIC_URL (例如用户配置了 HTTPS 域名) 时才会使用外部地址。
+fn get_oauth_redirect_uri(port: u16, _host: Option<&str>, _proto: Option<&str>) -> String {
     if let Ok(public_url) = std::env::var("ABV_PUBLIC_URL") {
         let base = public_url.trim_end_matches('/');
         format!("{}/auth/callback", base)
-    } else if let Some(host) = host {
-        // 如果提供了 host (从 Header 中提取)，动态构建重定向地址
-        let scheme = proto.unwrap_or("http");
-        format!("{}://{}/auth/callback", scheme, host)
     } else {
+        // 强制返回 localhost。远程部署时，用户可通过回填功能完成授权。
         format!("http://localhost:{}/auth/callback", port)
     }
 }
