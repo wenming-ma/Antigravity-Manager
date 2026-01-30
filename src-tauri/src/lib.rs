@@ -4,6 +4,7 @@ mod commands;
 mod utils;
 mod proxy;  // Proxy service module
 pub mod error;
+pub mod constants;
 
 use tauri::Manager;
 use modules::logger;
@@ -101,6 +102,29 @@ pub fn run() {
                         }
                     }
 
+                    // [NEW] 支持通过环境变量注入鉴权模式
+                    // 优先级：ABV_AUTH_MODE > AUTH_MODE > 配置文件
+                    let env_auth_mode = std::env::var("ABV_AUTH_MODE")
+                        .or_else(|_| std::env::var("AUTH_MODE"))
+                        .ok();
+                    
+                    if let Some(mode_str) = env_auth_mode {
+                        let mode = match mode_str.to_lowercase().as_str() {
+                            "off" => Some(crate::proxy::ProxyAuthMode::Off),
+                            "strict" => Some(crate::proxy::ProxyAuthMode::Strict),
+                            "all_except_health" => Some(crate::proxy::ProxyAuthMode::AllExceptHealth),
+                            "auto" => Some(crate::proxy::ProxyAuthMode::Auto),
+                            _ => {
+                                warn!("Invalid AUTH_MODE: {}, ignoring", mode_str);
+                                None
+                            }
+                        };
+                        if let Some(m) = mode {
+                            info!("Using Auth Mode from environment variable: {:?}", m);
+                            config.proxy.auth_mode = m;
+                        }
+                    }
+
                     info!("--------------------------------------------------");
                     info!("🚀 Headless mode proxy service starting...");
                     info!("📍 Port: {}", config.proxy.port);
@@ -154,6 +178,7 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let _ = app.get_webview_window("main")
                 .map(|window| {

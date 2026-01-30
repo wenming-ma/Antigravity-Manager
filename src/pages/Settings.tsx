@@ -35,7 +35,11 @@ function Settings() {
             upstream_proxy: {
                 enabled: false,
                 url: ''
-            }
+            },
+            debug_logging: {
+                enabled: false,
+                output_dir: undefined
+            } as { enabled: boolean; output_dir?: string }
         },
         scheduled_warmup: {
             enabled: false,
@@ -48,6 +52,10 @@ function Settings() {
         },
         pinned_quota_models: {
             models: ['gemini-3-pro-high', 'gemini-3-flash', 'gemini-3-pro-image', 'claude-sonnet-4-5-thinking']
+        },
+        circuit_breaker: {
+            enabled: false,
+            backoff_steps: [30, 60, 120, 300, 600]
         }
     });
 
@@ -173,6 +181,29 @@ function Settings() {
         }
     };
 
+    const handleSelectDebugLogDir = async () => {
+        try {
+            const selected = await open({
+                directory: true,
+                multiple: false,
+                title: t('settings.advanced.debug_log_dir_select', '选择调试日志输出目录'),
+            });
+            if (selected && typeof selected === 'string') {
+                setFormData({
+                    ...formData,
+                    proxy: {
+                        ...formData.proxy,
+                        debug_logging: {
+                            enabled: formData.proxy?.debug_logging?.enabled ?? false,
+                            output_dir: selected,
+                        },
+                    },
+                });
+            }
+        } catch (error) {
+            showToast(`${t('common.error')}: ${error}`, 'error');
+        }
+    };
 
     const handleDetectAntigravityPath = async () => {
         try {
@@ -695,6 +726,83 @@ function Settings() {
                                         </button>
                                     </div>
                                 </div>
+
+                                {/* 调试日志 */}
+                                <div className="border-t border-gray-200 dark:border-base-200 pt-4">
+                                    <div className="space-y-3">
+                                        <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-base-200 rounded-lg border border-gray-100 dark:border-base-300">
+                                            <div>
+                                                <div className="font-medium text-gray-900 dark:text-base-content">
+                                                    {t('settings.advanced.debug_logs_title', '调试日志')}
+                                                </div>
+                                                <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                                                    {t('settings.advanced.debug_logs_enable_desc', '启用后会记录完整请求与响应链路，建议仅在排查问题时开启。')}
+                                                </p>
+                                            </div>
+                                            <label className="relative inline-flex items-center cursor-pointer">
+                                                <input
+                                                    type="checkbox"
+                                                    className="sr-only peer"
+                                                    checked={formData.proxy?.debug_logging?.enabled ?? false}
+                                                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFormData({
+                                                        ...formData,
+                                                        proxy: {
+                                                            ...formData.proxy,
+                                                            debug_logging: {
+                                                                enabled: e.target.checked,
+                                                                output_dir: formData.proxy?.debug_logging?.output_dir,
+                                                            },
+                                                        },
+                                                    })}
+                                                />
+                                                <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
+                                            </label>
+                                        </div>
+                                        {(formData.proxy?.debug_logging?.enabled ?? false) && (
+                                            <>
+                                                <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700/30 rounded-lg p-3">
+                                                    <p className="text-sm text-amber-700 dark:text-amber-400">
+                                                        {t('settings.advanced.debug_logs_desc', '记录完整链路：原始输入、转换后的 v1internal 请求、以及上游响应。仅用于问题排查，可能包含敏感数据。')}
+                                                    </p>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">
+                                                        {t('settings.advanced.debug_log_dir', '调试日志输出目录')}
+                                                    </label>
+                                                    <div className="flex gap-2">
+                                                        <input
+                                                            type="text"
+                                                            className="flex-1 px-4 py-3 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
+                                                            value={formData.proxy?.debug_logging?.output_dir || ''}
+                                                            placeholder={`${dataDirPath.replace(/\/$/, '')}/debug_logs`}
+                                                            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFormData({
+                                                                ...formData,
+                                                                proxy: {
+                                                                    ...formData.proxy,
+                                                                    debug_logging: {
+                                                                        enabled: formData.proxy?.debug_logging?.enabled ?? false,
+                                                                        output_dir: e.target.value || undefined,
+                                                                    },
+                                                                },
+                                                            })}
+                                                        />
+                                                        {isTauri() && (
+                                                            <button
+                                                                className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors"
+                                                                onClick={handleSelectDebugLogDir}
+                                                            >
+                                                                {t('settings.advanced.select_btn')}
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">
+                                                        {t('settings.advanced.debug_log_dir_hint', `不填写则使用默认目录：${dataDirPath.replace(/\/$/, '')}/debug_logs`)}
+                                                    </p>
+                                                </div>
+                                            </>
+                                        )}
+                                    </div>
+                                </div>
                             </div>
                         </>
                     )}
@@ -787,7 +895,7 @@ function Settings() {
                                         <h3 className="text-3xl font-black text-gray-900 dark:text-base-content tracking-tight mb-2">Antigravity Tools</h3>
                                         <div className="flex items-center justify-center gap-2 text-sm">
                                             <span className="px-2.5 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 font-medium border border-blue-200 dark:border-blue-800">
-                                                v4.0.6
+                                                v4.0.8
                                             </span>
                                             <span className="text-gray-400 dark:text-gray-600">•</span>
                                             <span className="text-gray-500 dark:text-gray-400">Professional Account Management</span>

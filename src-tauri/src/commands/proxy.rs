@@ -123,6 +123,10 @@ pub async fn internal_start_proxy_service(
     let token_manager = Arc::new(TokenManager::new(accounts_dir));
     token_manager.start_auto_cleanup();
     token_manager.update_sticky_config(config.scheduling.clone()).await;
+    
+    // [NEW] 加载熔断配置 (从主配置加载)
+    let app_config = crate::modules::config::load_app_config().unwrap_or_else(|_| crate::models::AppConfig::new());
+    token_manager.update_circuit_breaker_config(app_config.circuit_breaker).await;
 
     // 🆕 [FIX #820] 恢复固定账号模式设置
     if let Some(ref account_id) = config.preferred_account_id {
@@ -222,6 +226,7 @@ pub async fn ensure_admin_server(
             config.zai.clone(),
             monitor,
             config.experimental.clone(),
+            config.debug_logging.clone(),
             integration.clone(),
             cloudflared_state,
         ).await {

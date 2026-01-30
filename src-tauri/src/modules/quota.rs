@@ -5,7 +5,6 @@ use crate::models::QuotaData;
 use crate::modules::config;
 
 const QUOTA_API_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels";
-const USER_AGENT: &str = "antigravity/1.11.3 Darwin/arm64";
 
 /// Critical retry threshold: considered near recovery when quota reaches 95%
 const NEAR_READY_THRESHOLD: i32 = 95;
@@ -74,7 +73,7 @@ async fn fetch_project_id(access_token: &str, email: &str) -> (Option<String>, O
         .post(format!("{}/v1internal:loadCodeAssist", CLOUD_CODE_BASE_URL))
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", access_token))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(reqwest::header::USER_AGENT, "antigravity/windows/amd64")
+        .header(reqwest::header::USER_AGENT, crate::constants::USER_AGENT.as_str())
         .json(&meta)
         .send()
         .await;
@@ -140,14 +139,13 @@ pub async fn fetch_quota_with_cache(
     });
     
     let url = QUOTA_API_URL;
-    let max_retries = 3;
     let mut last_error: Option<AppError> = None;
 
-    for attempt in 1..=max_retries {
+    for attempt in 1..=MAX_RETRIES {
         match client
             .post(url)
             .bearer_auth(access_token)
-            .header("User-Agent", USER_AGENT)
+            .header(reqwest::header::USER_AGENT, crate::constants::USER_AGENT.as_str())
             .json(&json!(payload))
             .send()
             .await
@@ -169,9 +167,9 @@ pub async fn fetch_quota_with_cache(
                     }
                     
                     // Continue retry logic for other errors
-                    if attempt < max_retries {
+                    if attempt < MAX_RETRIES {
                          let text = response.text().await.unwrap_or_default();
-                         crate::modules::logger::log_warn(&format!("API Error: {} - {} (Attempt {}/{})", status, text, attempt, max_retries));
+                         crate::modules::logger::log_warn(&format!("API Error: {} - {} (Attempt {}/{})", status, text, attempt, MAX_RETRIES));
                          last_error = Some(AppError::Unknown(format!("HTTP {} - {}", status, text)));
                          tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                          continue;
@@ -212,9 +210,9 @@ pub async fn fetch_quota_with_cache(
                 return Ok((quota_data, project_id.clone()));
             },
             Err(e) => {
-                crate::modules::logger::log_warn(&format!("Request failed: {} (Attempt {}/{})", e, attempt, max_retries));
+                crate::modules::logger::log_warn(&format!("Request failed: {} (Attempt {}/{})", e, attempt, MAX_RETRIES));
                 last_error = Some(AppError::Network(e));
-                if attempt < max_retries {
+                if attempt < MAX_RETRIES {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
